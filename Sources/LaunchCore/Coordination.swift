@@ -156,6 +156,58 @@ public final class Coordination: Sendable {
         }
     }
 
+    // MARK: - Queue departure counter
+
+    /// Customers who have left the waiting room for a launch, across all nodes.
+    ///
+    /// This is what makes a queue position O(1) instead of a count over everyone ahead
+    /// of you. It lives in Redis because it has to be shared — each node admits its own
+    /// batches, so a per-process counter would undercount by however much the other
+    /// nodes did — and because it is incremented once per admitted *batch* rather than
+    /// once per customer.
+    ///
+    /// It is allowed to drift. A lost increment makes positions read slightly high,
+    /// which is the safe direction to be wrong in for someone waiting, and
+    /// `reconcileDeparted` corrects it from Postgres on a slow timer.
+    private func departedKey(_ launchID: UUID) -> RedisKey {
+        RedisKey("launchos:departed:\(launchID.uuidString)")
+    }
+
+    @discardableResult
+    public func addDeparted(launchID: UUID, count: Int) async -> Int? {
+        guard let pool, count > 0 else { return nil }
+        do {
+            return try await pool.increment(departedKey(launchID), by: count).get()
+        } catch {
+            await MetricsRegistry.shared.increment("launchos_redis_errors_total")
+            return nil
+        }
+    }
+
+    public func departed(launchID: UUID) async -> Int? {
+        guard let pool else { return nil }
+        do {
+            let value = try await pool.get(departedKey(launchID), as: String.self).get()
+            return value.flatMap { Int($0) }
+        } catch {
+            await MetricsRegistry.shared.increment("launchos_redis_errors_total")
+            return nil
+        }
+    }
+
+    /// Overwrites the counter with a figure counted in Postgres.
+    ///
+    /// Called on a slow timer rather than on the request path: the counter is an
+    /// optimisation, and the authoritative answer is always a count of the table.
+    public func setDeparted(launchID: UUID, to value: Int) async {
+        guard let pool else { return }
+        do {
+            try await pool.set(departedKey(launchID), to: String(value)).get()
+        } catch {
+            await MetricsRegistry.shared.increment("launchos_redis_errors_total")
+        }
+    }
+
     /// Registers this node as alive, so recovery can tell which reservations belong to
     /// a process that is gone.
     public func heartbeat(nodeID: String, ttl: Duration = .seconds(6)) async {

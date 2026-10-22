@@ -16,6 +16,12 @@ CREATE TABLE IF NOT EXISTS launches (
     -- node agrees on whether checkout requires admission even though the admission
     -- controller itself is in-memory and per-node.
     requires_admission BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Name of this launch's own arrival sequence. A queue position has to be answerable
+    -- in constant time, which needs a dense arrival index per launch -- and the shared
+    -- queue_seq below cannot give one, because every launch draws from it and their
+    -- numbers interleave. A sequence per launch is dense by construction, and sequences
+    -- are non-transactional, so drawing from one costs no row lock.
+    queue_sequence     TEXT,
     reservation_ttl_ms BIGINT NOT NULL DEFAULT 90000,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -95,6 +101,11 @@ CREATE TABLE IF NOT EXISTS queue_entries (
     launch_id    UUID NOT NULL REFERENCES launches(id) ON DELETE CASCADE,
     customer_id  TEXT NOT NULL,
     seq          BIGINT NOT NULL DEFAULT nextval('queue_seq'),
+    -- Dense 1-based arrival index within this launch. seq still decides ordering and
+    -- durability; this exists so "how many are ahead of me" is arithmetic rather than a
+    -- count over everyone ahead. Zero means no per-launch sequence was available, and
+    -- positions fall back to counting.
+    arrival_index BIGINT NOT NULL DEFAULT 0,
     bucket       BIGINT NOT NULL,
     arrival_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     state        TEXT NOT NULL CHECK (state IN ('waiting','admitted','expired')),
@@ -108,6 +119,9 @@ CREATE INDEX IF NOT EXISTS queue_waiting_idx
     ON queue_entries (launch_id, seq) WHERE state = 'waiting';
 CREATE INDEX IF NOT EXISTS queue_bucket_idx
     ON queue_entries (launch_id, bucket, seq) WHERE state = 'waiting';
+-- Supports reconciling the departure counter against the table.
+CREATE INDEX IF NOT EXISTS queue_departed_idx
+    ON queue_entries (launch_id) WHERE state <> 'waiting';
 
 -- Monotonic counter for admission order, so fairness can be measured as the
 -- correlation between arrival seq and admission seq.
@@ -128,4 +142,13 @@ CREATE TABLE IF NOT EXISTS shard_leases (
 );
 
 CREATE INDEX IF NOT EXISTS shard_leases_owner_idx ON shard_leases (launch_id, owner_node);
+
+-- Migrations for databases created by an earlier version.
+--
+-- Everything above is CREATE ... IF NOT EXISTS, which creates a missing table but will
+-- not add a column to one that already exists -- so on an existing database the new
+-- columns simply never appeared and every query referencing them failed. These are
+-- idempotent, so migrate() stays a loop that can run on every boot.
+ALTER TABLE launches ADD COLUMN IF NOT EXISTS queue_sequence TEXT;
+ALTER TABLE queue_entries ADD COLUMN IF NOT EXISTS arrival_index BIGINT NOT NULL DEFAULT 0;
 """

@@ -116,6 +116,10 @@ struct QueueStatusView: Content {
     var customerID: String
     var arrivalSeq: Int64
     var position: Int
+    /// Whether the position was estimated in constant time, counted exactly, or served
+    /// from cache. Exposed so a caller can tell the three apart rather than having to
+    /// trust one number.
+    var positionSource: String
     var state: String
     var admitted: Bool
     var retries: Int

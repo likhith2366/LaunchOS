@@ -13,6 +13,10 @@ public struct Launch: Sendable, Codable, Equatable {
     public var collapsed: Bool
     /// True when the launch has a waiting room, so checkout must check admission.
     public var requiresAdmission: Bool
+    /// Name of this launch's own arrival sequence, used to hand out a dense arrival
+    /// index so a queue position costs no count. Nil for a launch created before the
+    /// per-launch sequence existed, which falls back to counting.
+    public var queueSequence: String?
     public var reservationTTL: Duration
 
     public init(
@@ -23,6 +27,7 @@ public struct Launch: Sendable, Codable, Equatable {
         collapseThreshold: Int = 0,
         collapsed: Bool = false,
         requiresAdmission: Bool = false,
+        queueSequence: String? = nil,
         reservationTTL: Duration = .seconds(90)
     ) {
         self.id = id
@@ -32,6 +37,7 @@ public struct Launch: Sendable, Codable, Equatable {
         self.collapseThreshold = collapseThreshold
         self.collapsed = collapsed
         self.requiresAdmission = requiresAdmission
+        self.queueSequence = queueSequence
         self.reservationTTL = reservationTTL
     }
 }
@@ -157,6 +163,9 @@ public struct QueueEntry: Sendable, Codable, Equatable {
     public var launchID: UUID
     public var customerID: String
     public var seq: Int64
+    /// Dense 1-based arrival index within this launch. Zero when the launch has no
+    /// arrival sequence, in which case positions are counted rather than estimated.
+    public var arrivalIndex: Int64
     public var bucket: Int64
     public var arrivalAt: Date
     public var state: QueueEntryState
@@ -167,6 +176,7 @@ public struct QueueEntry: Sendable, Codable, Equatable {
         launchID: UUID,
         customerID: String,
         seq: Int64,
+        arrivalIndex: Int64 = 0,
         bucket: Int64,
         arrivalAt: Date,
         state: QueueEntryState,
@@ -176,6 +186,7 @@ public struct QueueEntry: Sendable, Codable, Equatable {
         self.launchID = launchID
         self.customerID = customerID
         self.seq = seq
+        self.arrivalIndex = arrivalIndex
         self.bucket = bucket
         self.arrivalAt = arrivalAt
         self.state = state

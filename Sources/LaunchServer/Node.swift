@@ -12,6 +12,7 @@ final class Node: Sendable {
     let allocator: Allocator
     let room: WaitingRoom
     let health: HealthMonitor
+    let positions: PositionEstimator
     let checkout: CheckoutCoordinator
     let sweeper: Sweeper
     let recovery: CrashRecovery
@@ -54,6 +55,9 @@ final class Node: Sendable {
             bucketWidth: Double(env["QUEUE_BUCKET_SECONDS"] ?? "1") ?? 1
         )
         self.health = HealthMonitor()
+        self.positions = PositionEstimator(
+            room: room, coordination: coordination, logger: logger
+        )
         self.checkout = CheckoutCoordinator(
             store: store, allocator: allocator, room: room, health: health,
             nodeID: nodeID, logger: logger,

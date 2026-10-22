@@ -75,13 +75,14 @@ func routes(_ app: Application) throws {
             requiresAdmission: body.admission != nil,
             reservationTTL: .milliseconds(Int((body.reservationTTLSeconds ?? 90) * 1000))
         )
-        try await n.store.createLaunch(launch)
-        await n.directory.store(launch)
+        // The stored launch carries the arrival sequence name, which the join path needs.
+        let stored = try await n.store.createLaunch(launch)
+        await n.directory.store(stored)
 
         if let admission = body.admission {
             let config = admission.config()
             let controller = AdmissionController(
-                config: config, health: n.health, room: n.room,
+                config: config, health: n.health, room: n.room, positions: n.positions,
                 launchID: launch.id, sku: launch.sku, logger: n.logger
             )
             await n.controllers.replace(launch.id, with: controller)
@@ -98,7 +99,7 @@ func routes(_ app: Application) throws {
                 )
             )
         }
-        return LaunchView(launch)
+        return LaunchView(stored)
     }
 
     /// Every launch, for the operator view's selector.
@@ -132,14 +133,25 @@ func routes(_ app: Application) throws {
         let body = try req.content.decode(JoinQueueBody.self)
         let n = req.node
         let launch = try await n.launch(sku: sku)
-        let result = try await n.room.join(launchID: launch.id, customerID: body.customerID)
+        let result = try await n.room.join(
+            launchID: launch.id, customerID: body.customerID,
+            arrivalSequence: launch.queueSequence
+        )
+        // Constant time, like the poll path. A join used to end with an exact count over
+        // everyone already waiting, which is the same O(queue depth) work and happens
+        // once per customer at exactly the moment they are all arriving.
+        let position = try await n.positions.position(
+            launchID: launch.id, seq: result.entry.seq,
+            arrivalIndex: result.entry.arrivalIndex
+        )
         await n.coordination.cachePosition(
-            launchID: launch.id, customerID: body.customerID, position: result.position
+            launchID: launch.id, customerID: body.customerID, position: position.position
         )
         return QueueStatusView(
             customerID: body.customerID,
             arrivalSeq: result.entry.seq,
-            position: result.position,
+            position: position.position,
+            positionSource: position.source.rawValue,
             state: result.entry.state.rawValue,
             admitted: result.entry.state == .admitted,
             retries: result.retries,
@@ -157,24 +169,57 @@ func routes(_ app: Application) throws {
         guard let entry = try await n.room.entry(launchID: launch.id, customerID: customerID) else {
             throw Abort(.notFound, reason: "\(customerID) is not in the queue")
         }
-        // Position is counted over the waiting set, so it is the expensive part of this
-        // request and the reason the Redis cache exists. It is only computed when the
-        // cache misses, and not at all once the customer has been admitted.
-        var position = 0
+        // This is the most frequent request in a launch, so position is computed in
+        // constant time rather than counted.
+        //
+        // `?position=` overrides which path answers: `exact` forces the count, `estimated`
+        // skips the cache, `cached` is the default. Without the override the three cannot
+        // be compared — a second poll is served from cache, so a benchmark would be
+        // timing Redis and calling it the estimator — and the estimate's error against
+        // the count it replaced would be unmeasurable rather than merely unmeasured.
+        let requested = (try? req.query.get(String.self, at: "position")).flatMap(
+            PositionSource.init(rawValue:)
+        )
+        // Kept for compatibility with the earlier `?exact=true`.
+        let wantsExact =
+            requested == .exactCount || ((try? req.query.get(Bool.self, at: "exact")) ?? false)
+
+        var position = QueuePosition(position: 0, source: .estimated)
         if entry.state == .waiting {
-            if let cached = await n.coordination.cachedPosition(launchID: launch.id, customerID: customerID) {
-                position = cached
+            let started = ContinuousClock.now
+            if wantsExact {
+                position = QueuePosition(
+                    position: try await n.room.position(launchID: launch.id, seq: entry.seq),
+                    source: .exactCount
+                )
+            } else if requested != .estimated,
+                let cached = await n.coordination.cachedPosition(
+                    launchID: launch.id, customerID: customerID
+                )
+            {
+                position = QueuePosition(position: cached, source: .cached)
             } else {
-                position = try await n.room.position(launchID: launch.id, seq: entry.seq)
+                position = try await n.positions.position(
+                    launchID: launch.id, seq: entry.seq, arrivalIndex: entry.arrivalIndex
+                )
                 await n.coordination.cachePosition(
-                    launchID: launch.id, customerID: customerID, position: position
+                    launchID: launch.id, customerID: customerID, position: position.position
                 )
             }
+            // Timed server-side and labelled by which path answered. Timing this from a
+            // client measures process startup and the network, which on a loopback
+            // benchmark is several times the work being compared.
+            await MetricsRegistry.shared.observe(
+                "launchos_position_duration_ms", started.duration(to: .now).milliseconds,
+                labels: ["source": position.source.rawValue],
+                help: "Time to answer a queue position, by how it was answered"
+            )
         }
         return QueueStatusView(
             customerID: customerID,
             arrivalSeq: entry.seq,
-            position: position,
+            position: position.position,
+            positionSource: position.source.rawValue,
             state: entry.state.rawValue,
             admitted: entry.state == .admitted,
             retries: 0,
@@ -366,6 +411,7 @@ func routes(_ app: Application) throws {
         let n = req.node
         await n.controllers.stopAll()
         await n.directory.clear()
+        await n.positions.forgetAll()
         try await n.store.reset()
         return .noContent
     }

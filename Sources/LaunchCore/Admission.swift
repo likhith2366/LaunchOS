@@ -193,6 +193,8 @@ public actor AdmissionController {
     public nonisolated let config: AdmissionConfig
     private let health: HealthMonitor
     private let room: WaitingRoom
+    /// Told about each admitted batch, so queue positions can move without counting.
+    private let positions: PositionEstimator?
     private let launchID: UUID
     private let sku: String
     private let logger: Logger
@@ -211,6 +213,7 @@ public actor AdmissionController {
         config: AdmissionConfig,
         health: HealthMonitor,
         room: WaitingRoom,
+        positions: PositionEstimator? = nil,
         launchID: UUID,
         sku: String,
         seed: UInt64 = 0x5EED,
@@ -219,6 +222,7 @@ public actor AdmissionController {
         self.config = config
         self.health = health
         self.room = room
+        self.positions = positions
         self.launchID = launchID
         self.sku = sku
         self.rate = config.initialRate
@@ -279,6 +283,9 @@ public actor AdmissionController {
         let admitDuration = admitStarted.duration(to: .now).milliseconds
         totalAdmitted += admitted.count
         admitDurations.add(admitDuration)
+        // One counter increment per batch, which is what keeps the poll path from
+        // having to count anybody.
+        await positions?.recordDepartures(launchID: launchID, count: admitted.count)
 
         await MetricsRegistry.shared.set(
             "launchos_admission_rate", to: rate, labels: ["sku": sku],

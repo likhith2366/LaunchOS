@@ -75,40 +75,64 @@ public struct WaitingRoom: Sendable {
     /// back the row the first one created, leaving `seq` — and therefore the customer's
     /// place in line — untouched. A customer who refreshes twenty times holds the
     /// position they got on arrival.
-    public func join(launchID: UUID, customerID: String, at now: Date = Date()) async throws -> QueueJoinResult {
+    /// - Parameter arrivalSequence: the launch's own arrival sequence, which hands out
+    ///   the dense index a constant-time position is computed from. Nil falls back to
+    ///   zero, and positions for that launch are counted instead.
+    public func join(
+        launchID: UUID,
+        customerID: String,
+        arrivalSequence: String? = nil,
+        at now: Date = Date()
+    ) async throws -> QueueJoinResult {
         let started = ContinuousClock.now
         let b = bucket(for: now)
-        let rows = try await store.client.query(
-            """
+        // `nextval` is only drawn on an actual insert. On the conflict path the existing
+        // row keeps the index it was given, which is the same guarantee as `seq`: a
+        // customer who refreshes keeps the arrival they had. The sequence does advance
+        // on a conflicting insert, leaving a gap, which is harmless — gaps make a
+        // position read high, never low.
+        var binds = PostgresBindings()
+        binds.append(launchID, context: .default)
+        binds.append(customerID, context: .default)
+        binds.append(b, context: .default)
+        binds.append(now, context: .default)
+        if let arrivalSequence { binds.append(arrivalSequence, context: .default) }
+        let indexExpression = arrivalSequence == nil ? "0::bigint" : "nextval($5::regclass)"
+        let sql = """
             WITH joined AS (
-                INSERT INTO queue_entries (launch_id, customer_id, bucket, arrival_at, state)
-                VALUES (\(launchID), \(customerID), \(b), \(now), 'waiting')
+                INSERT INTO queue_entries
+                    (launch_id, customer_id, bucket, arrival_at, state, arrival_index)
+                VALUES ($1, $2, $3, $4, 'waiting', \(indexExpression))
                 ON CONFLICT (launch_id, customer_id)
                 DO UPDATE SET retries = queue_entries.retries + 1
-                RETURNING seq, bucket, arrival_at, state, admitted_seq, admitted_at, retries
+                RETURNING seq, arrival_index, bucket, arrival_at, state, admitted_seq,
+                          admitted_at, retries
             )
-            SELECT joined.seq, joined.bucket, joined.arrival_at, joined.state,
-                   joined.admitted_seq, joined.admitted_at, joined.retries,
-                   CASE WHEN joined.state = 'waiting' THEN (
-                       SELECT count(*)::bigint FROM queue_entries ahead
-                        WHERE ahead.launch_id = \(launchID)
-                          AND ahead.state = 'waiting' AND ahead.seq < joined.seq
-                   ) ELSE 0::bigint END
+            SELECT joined.seq, joined.arrival_index, joined.bucket, joined.arrival_at,
+                   joined.state, joined.admitted_seq, joined.admitted_at, joined.retries
               FROM joined
-            """,
-            logger: logger
+            """
+        let rows = try await store.client.query(
+            PostgresQuery(unsafeSQL: sql, binds: binds), logger: logger
         )
         var result: QueueJoinResult?
-        for try await (seq, bucket, arrivalAt, state, admittedSeq, admittedAt, retries, position) in rows.decode(
-            (Int64, Int64, Date, String, Int64?, Date?, Int, Int64).self
-        ) {
+        for try await (seq, arrivalIndex, bucket, arrivalAt, state, admittedSeq, admittedAt, retries)
+            in rows.decode((Int64, Int64, Int64, Date, String, Int64?, Date?, Int).self)
+        {
             let entry = QueueEntry(
-                launchID: launchID, customerID: customerID, seq: seq, bucket: bucket,
+                launchID: launchID, customerID: customerID, seq: seq,
+                arrivalIndex: arrivalIndex, bucket: bucket,
                 arrivalAt: arrivalAt, state: QueueEntryState(rawValue: state) ?? .waiting,
                 admittedSeq: admittedSeq, admittedAt: admittedAt
             )
+            // No position here on purpose. Folding the count into this statement saves a
+            // round-trip, which is why it was written that way, but the count itself is
+            // O(the number of people already waiting) — so at a million joins it is a
+            // million scans of up to a million index entries, and the round-trip was
+            // never the expensive part. The caller fills the position in from
+            // `PositionEstimator` in constant time.
             result = QueueJoinResult(
-                entry: entry, position: Int(position), wasAlreadyQueued: retries > 0, retries: retries
+                entry: entry, position: 0, wasAlreadyQueued: retries > 0, retries: retries
             )
         }
         guard let result else { throw LaunchError.launchNotFound(launchID.uuidString) }
@@ -133,6 +157,30 @@ public struct WaitingRoom: Sendable {
         return 0
     }
 
+    /// The seq the launch's queue started at. Immutable once anyone has joined, so it is
+    /// read once per launch per node and then cached.
+    func firstSeq(launchID: UUID) async throws -> Int64? {
+        let rows = try await store.client.query(
+            "SELECT min(seq)::bigint FROM queue_entries WHERE launch_id = \(launchID)",
+            logger: logger
+        )
+        for try await value in rows.decode(Int64?.self) { return value }
+        return nil
+    }
+
+    /// Customers who have left the waiting room, counted in Postgres.
+    func departedCount(launchID: UUID) async throws -> Int {
+        let rows = try await store.client.query(
+            """
+            SELECT count(*)::bigint FROM queue_entries
+             WHERE launch_id = \(launchID) AND state <> 'waiting'
+            """,
+            logger: logger
+        )
+        for try await n in rows.decode(Int64.self) { return Int(n) }
+        return 0
+    }
+
     /// Reads a customer's queue entry without computing their position.
     ///
     /// Position is a separate call because it is the expensive half — a count over the
@@ -143,16 +191,17 @@ public struct WaitingRoom: Sendable {
     public func entry(launchID: UUID, customerID: String) async throws -> QueueEntry? {
         let rows = try await store.client.query(
             """
-            SELECT seq, bucket, arrival_at, state, admitted_seq, admitted_at
+            SELECT seq, arrival_index, bucket, arrival_at, state, admitted_seq, admitted_at
               FROM queue_entries WHERE launch_id = \(launchID) AND customer_id = \(customerID)
             """,
             logger: logger
         )
-        for try await (seq, bucket, arrivalAt, state, admittedSeq, admittedAt) in rows.decode(
-            (Int64, Int64, Date, String, Int64?, Date?).self
-        ) {
+        for try await (seq, arrivalIndex, bucket, arrivalAt, state, admittedSeq, admittedAt)
+            in rows.decode((Int64, Int64, Int64, Date, String, Int64?, Date?).self)
+        {
             return QueueEntry(
-                launchID: launchID, customerID: customerID, seq: seq, bucket: bucket,
+                launchID: launchID, customerID: customerID, seq: seq,
+                arrivalIndex: arrivalIndex, bucket: bucket,
                 arrivalAt: arrivalAt, state: QueueEntryState(rawValue: state) ?? .waiting,
                 admittedSeq: admittedSeq, admittedAt: admittedAt
             )

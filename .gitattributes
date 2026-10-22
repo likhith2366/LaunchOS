@@ -1,0 +1,13 @@
+# Normalise everything to LF in the repository and in the working tree.
+#
+# Without this, git was converting checkouts to CRLF on Windows while the build and the
+# shell scripts run under WSL. A CRLF shell script fails with "invalid option name"
+# because the interpreter sees a trailing carriage return, and every commit churned
+# whole files on line endings alone.
+* text=auto eol=lf
+
+# Binary, so never touched.
+*.png binary
+*.jpg binary
+*.pdf binary
+*.woff2 binary

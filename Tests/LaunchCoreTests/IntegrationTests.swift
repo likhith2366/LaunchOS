@@ -59,8 +59,9 @@ struct Harness {
             collapseThreshold: collapseThreshold,
             reservationTTL: ttl
         )
-        try await store.createLaunch(launch)
-        return launch
+        // Returned rather than the local value, so the launch carries the arrival
+        // sequence the store just created for it.
+        return try await store.createLaunch(launch)
     }
 
     func allocator(config: AllocatorConfig = AllocatorConfig(), node: String = "test-node") -> Allocator {
@@ -531,8 +532,12 @@ struct QueueIntegrationTests {
         for i in 0..<10 {
             joins.append(try await room.join(launchID: launch.id, customerID: "c\(i)"))
         }
-        #expect(joins.first?.position == 0)
-        #expect(joins.last?.position == 9)
+        // Joining no longer counts anybody — that is the point of the estimator — so
+        // positions are asked for separately.
+        let firstSeq = try #require(joins.first?.entry.seq)
+        let lastSeq = try #require(joins.last?.entry.seq)
+        #expect(try await room.position(launchID: launch.id, seq: firstSeq) == 0)
+        #expect(try await room.position(launchID: launch.id, seq: lastSeq) == 9)
         #expect(try await room.depth(launchID: launch.id) == 10)
 
         // Admitting the front of the queue moves everyone behind them up.
@@ -543,6 +548,105 @@ struct QueueIntegrationTests {
         #expect(try await room.depth(launchID: launch.id) == 7)
         let lastPosition = try await room.position(launchID: launch.id, seq: joins.last!.entry.seq)
         #expect(lastPosition == 6)
+    }
+
+    /// The estimator is what makes a million-person queue answerable, so it has to
+    /// agree with the count it replaced wherever that count is the right answer.
+    @Test("the constant-time estimate matches the exact count under FIFO")
+    func estimateMatchesExactCount() async throws {
+        let h = try await Harness()
+        defer { h.shutdown() }
+        let launch = try await h.makeLaunch(units: 500, shards: 1)
+        let room = h.room
+        let estimator = PositionEstimator(
+            room: room,
+            // No Redis in the unit environment, so the estimator falls back to its own
+            // counted baseline. That is the path worth testing anyway: it is what runs
+            // when the cache is cold or down.
+            coordination: Coordination(
+                config: RedisConfig(enabled: false), logger: silentLogger
+            ),
+            logger: silentLogger,
+            refreshInterval: .zero
+        )
+
+        var entries: [QueueEntry] = []
+        for i in 0..<60 {
+            let join = try await room.join(
+                launchID: launch.id, customerID: "c\(i)",
+                arrivalSequence: launch.queueSequence
+            )
+            entries.append(join.entry)
+        }
+
+        // Nobody has left yet: the estimate is the arrival index.
+        for (index, entry) in entries.enumerated() {
+            let estimated = try await estimator.position(
+                launchID: launch.id, seq: entry.seq, arrivalIndex: entry.arrivalIndex
+            )
+            let exact = try await room.position(launchID: launch.id, seq: entry.seq)
+            #expect(
+                estimated.position == exact,
+                "at index \(index): \(estimated.position) vs \(exact)"
+            )
+        }
+
+        // Admit the front of the queue in FIFO order, which is the case the estimate is
+        // exact for, and check it tracks.
+        _ = try await room.admit(
+            launchID: launch.id, count: 25, policy: .strictFIFO, commitHorizon: .zero
+        )
+        await estimator.forgetAll()
+        for (index, entry) in entries.enumerated() where index >= 25 {
+            let estimated = try await estimator.position(
+                launchID: launch.id, seq: entry.seq, arrivalIndex: entry.arrivalIndex
+            )
+            let exact = try await room.position(launchID: launch.id, seq: entry.seq)
+            #expect(
+                estimated.position == exact,
+                "after admission, at index \(index): \(estimated.position) vs \(exact)"
+            )
+        }
+    }
+
+    /// Departures counted through the estimator must move positions without anyone
+    /// touching the table, because that is the only reason the estimate is cheap.
+    @Test("recorded departures move the estimate")
+    func recordedDeparturesMoveEstimate() async throws {
+        let h = try await Harness()
+        defer { h.shutdown() }
+        let launch = try await h.makeLaunch(units: 100, shards: 1)
+        let room = h.room
+        let estimator = PositionEstimator(
+            room: room,
+            coordination: Coordination(config: RedisConfig(enabled: false), logger: silentLogger),
+            logger: silentLogger,
+            // Long enough that the baseline is not silently re-counted mid-test, so the
+            // only thing that can move the answer is the recorded departure.
+            refreshInterval: .seconds(600)
+        )
+
+        var entries: [QueueEntry] = []
+        for i in 0..<20 {
+            entries.append(
+                try await room.join(
+                    launchID: launch.id, customerID: "c\(i)",
+                    arrivalSequence: launch.queueSequence
+                ).entry
+            )
+        }
+        let last = try #require(entries.last)
+        let before = try await estimator.position(
+            launchID: launch.id, seq: last.seq, arrivalIndex: last.arrivalIndex
+        )
+        #expect(before.position == 19)
+        #expect(before.source == .estimated)
+
+        await estimator.recordDepartures(launchID: launch.id, count: 5)
+        let after = try await estimator.position(
+            launchID: launch.id, seq: last.seq, arrivalIndex: last.arrivalIndex
+        )
+        #expect(after.position == 14)
     }
 
     @Test("strict FIFO admits in arrival order")
