@@ -79,11 +79,34 @@ public final class Store: Sendable {
         await client.run()
     }
 
+    /// The name of a launch's arrival sequence.
+    ///
+    /// Derived from the launch id and never supplied by a caller, because it is
+    /// interpolated into DDL where no parameter binding exists. Hyphens are stripped so
+    /// the result is a bare identifier needing no quoting, and a UUID's 32 hex digits
+    /// plus the prefix sit well inside Postgres's 63-character identifier limit.
+    static func arrivalSequenceName(for launchID: UUID) -> String {
+        "queue_arrival_" + launchID.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
     // MARK: - Schema
 
     public func migrate() async throws {
         for statement in Self.schemaStatements {
-            _ = try await client.query(PostgresQuery(unsafeSQL: statement), logger: logger)
+            do {
+                _ = try await client.query(PostgresQuery(unsafeSQL: statement), logger: logger)
+            } catch {
+                // PSQLError's default description deliberately hides its detail to avoid
+                // leaking data into logs. During migration that detail is the only thing
+                // that matters, and a schema statement carries no user data, so it is
+                // reflected into the message along with the statement that failed.
+                let first = statement.split(whereSeparator: \.isNewline)
+                    .first.map(String.init) ?? statement
+                throw LaunchError.invariantViolated(
+                    "migration failed on `\(first.trimmingCharacters(in: .whitespaces))`: "
+                        + String(reflecting: error)
+                )
+            }
         }
     }
 
@@ -94,6 +117,22 @@ public final class Store: Sendable {
         for s in ["queue_seq", "admission_seq", "fence_seq"] {
             _ = try? await client.query(PostgresQuery(unsafeSQL: "ALTER SEQUENCE \(s) RESTART WITH 1"), logger: logger)
         }
+        // Per-launch arrival sequences are objects, not rows, so TRUNCATE CASCADE leaves
+        // them behind. Left alone they accumulate for the lifetime of the database.
+        let leftover = try? await client.query(
+            """
+            SELECT sequencename FROM pg_sequences
+             WHERE schemaname = current_schema() AND sequencename LIKE 'queue_arrival_%'
+            """,
+            logger: logger
+        )
+        if let leftover {
+            for try await name in leftover.decode(String.self) {
+                _ = try? await client.query(
+                    PostgresQuery(unsafeSQL: "DROP SEQUENCE IF EXISTS \(name)"), logger: logger
+                )
+            }
+        }
     }
 
     // MARK: - Launches
@@ -101,19 +140,34 @@ public final class Store: Sendable {
     /// Creates the launch and splits its units across `shardCount` rows. The remainder
     /// is spread one unit at a time over the low shards rather than dumped on shard 0,
     /// because a lopsided split makes the sharding measurement look better than it is.
-    public func createLaunch(_ launch: Launch) async throws {
+    /// Creates the launch and returns it as stored, including the name of the arrival
+    /// sequence this call created. Callers need that name to hand out arrival indexes,
+    /// and deriving it twice in two places is how they drift apart.
+    @discardableResult
+    public func createLaunch(_ launch: Launch) async throws -> Launch {
         let ttlMS = Int64(launch.reservationTTL.milliseconds)
+        // One arrival sequence per launch, so a customer's position in that launch is a
+        // dense index and can be answered by arithmetic. The name is derived from the
+        // launch id rather than supplied, because it goes into DDL.
+        let sequenceName = Self.arrivalSequenceName(for: launch.id)
+        _ = try await client.query(
+            PostgresQuery(unsafeSQL: "CREATE SEQUENCE IF NOT EXISTS \(sequenceName)"),
+            logger: logger
+        )
         _ = try await client.query(
             """
             INSERT INTO launches
                 (id, sku, total_units, shard_count, collapse_threshold, collapsed,
-                 requires_admission, reservation_ttl_ms)
+                 requires_admission, queue_sequence, reservation_ttl_ms)
             VALUES (\(launch.id), \(launch.sku), \(launch.totalUnits), \(launch.shardCount),
                     \(launch.collapseThreshold), \(launch.collapsed),
-                    \(launch.requiresAdmission), \(ttlMS))
+                    \(launch.requiresAdmission), \(sequenceName), \(ttlMS))
             """,
             logger: logger
         )
+        var stored = launch
+        stored.queueSequence = sequenceName
+
         let base = launch.totalUnits / launch.shardCount
         let remainder = launch.totalUnits % launch.shardCount
         for shard in 0..<launch.shardCount {
@@ -126,24 +180,26 @@ public final class Store: Sendable {
                 logger: logger
             )
         }
+        return stored
     }
 
     public func launch(sku: String) async throws -> Launch {
         let rows = try await client.query(
             """
             SELECT id, sku, total_units, shard_count, collapse_threshold, collapsed,
-                   requires_admission, reservation_ttl_ms
+                   requires_admission, queue_sequence, reservation_ttl_ms
             FROM launches WHERE sku = \(sku)
             """,
             logger: logger
         )
-        for try await (id, sku, total, shards, threshold, collapsed, requiresAdmission, ttl) in rows.decode(
-            (UUID, String, Int, Int, Int, Bool, Bool, Int64).self
-        ) {
+        for try await (id, sku, total, shards, threshold, collapsed, requiresAdmission, sequence, ttl)
+            in rows.decode((UUID, String, Int, Int, Int, Bool, Bool, String?, Int64).self)
+        {
             return Launch(
                 id: id, sku: sku, totalUnits: total, shardCount: shards,
                 collapseThreshold: threshold, collapsed: collapsed,
-                requiresAdmission: requiresAdmission, reservationTTL: .milliseconds(ttl)
+                requiresAdmission: requiresAdmission, queueSequence: sequence,
+                reservationTTL: .milliseconds(ttl)
             )
         }
         throw LaunchError.launchNotFound(sku)
@@ -153,18 +209,19 @@ public final class Store: Sendable {
         let rows = try await client.query(
             """
             SELECT id, sku, total_units, shard_count, collapse_threshold, collapsed,
-                   requires_admission, reservation_ttl_ms
+                   requires_admission, queue_sequence, reservation_ttl_ms
             FROM launches WHERE id = \(id)
             """,
             logger: logger
         )
-        for try await (id, sku, total, shards, threshold, collapsed, requiresAdmission, ttl) in rows.decode(
-            (UUID, String, Int, Int, Int, Bool, Bool, Int64).self
-        ) {
+        for try await (id, sku, total, shards, threshold, collapsed, requiresAdmission, sequence, ttl)
+            in rows.decode((UUID, String, Int, Int, Int, Bool, Bool, String?, Int64).self)
+        {
             return Launch(
                 id: id, sku: sku, totalUnits: total, shardCount: shards,
                 collapseThreshold: threshold, collapsed: collapsed,
-                requiresAdmission: requiresAdmission, reservationTTL: .milliseconds(ttl)
+                requiresAdmission: requiresAdmission, queueSequence: sequence,
+                reservationTTL: .milliseconds(ttl)
             )
         }
         throw LaunchError.launchNotFound(id.uuidString)
@@ -175,20 +232,21 @@ public final class Store: Sendable {
         let rows = try await client.query(
             """
             SELECT id, sku, total_units, shard_count, collapse_threshold, collapsed,
-                   requires_admission, reservation_ttl_ms
+                   requires_admission, queue_sequence, reservation_ttl_ms
             FROM launches ORDER BY created_at
             """,
             logger: logger
         )
         var out: [Launch] = []
-        for try await (id, sku, total, shards, threshold, collapsed, requiresAdmission, ttl) in rows
-            .decode((UUID, String, Int, Int, Int, Bool, Bool, Int64).self)
+        for try await (id, sku, total, shards, threshold, collapsed, requiresAdmission, sequence, ttl)
+            in rows.decode((UUID, String, Int, Int, Int, Bool, Bool, String?, Int64).self)
         {
             out.append(
                 Launch(
                     id: id, sku: sku, totalUnits: total, shardCount: shards,
                     collapseThreshold: threshold, collapsed: collapsed,
-                    requiresAdmission: requiresAdmission, reservationTTL: .milliseconds(ttl)
+                    requiresAdmission: requiresAdmission, queueSequence: sequence,
+                    reservationTTL: .milliseconds(ttl)
                 )
             )
         }
@@ -246,13 +304,17 @@ public final class Store: Sendable {
     /// single snapshot rather than four successive ones. For the fragmentation
     /// measurement that is more honest, not less — "none of this customer's shards had
     /// stock" is now a statement about one instant.
+    ///
+    /// - Parameter skipLocked: whether a shard currently locked by another transaction is
+    ///   skipped or waited for. See `Allocator.reserve` for why both are needed.
     func probe(
         launchID: UUID,
         shardIDs: [Int],
         customerID: String,
         units: Int,
         ownerNode: String,
-        ttl: Duration
+        ttl: Duration,
+        skipLocked: Bool = true
     ) async throws -> Reservation? {
         guard !shardIDs.isEmpty else { return nil }
         let reservationID = UUID()
@@ -268,7 +330,10 @@ public final class Store: Sendable {
                    AND available >= \(units)
                  ORDER BY array_position(\(shardIDs), shard_id)
                  LIMIT 1
-                   FOR UPDATE SKIP LOCKED
+                   -- A literal chosen by the caller's Bool, never anything from a
+                   -- request; `unescaped` is the only way to vary a lock clause and it
+                   -- must never carry input.
+                   FOR UPDATE \(unescaped: skipLocked ? "SKIP LOCKED" : "")
             ),
             taken AS (
                 UPDATE inventory_shards i
@@ -770,18 +835,77 @@ public final class Store: Sendable {
         return 0
     }
 
+    /// The schema, split into statements.
+    ///
+    /// This used to be `schemaSQL.split(separator: ";")`, which is wrong in a way that
+    /// takes a while to show up: a semicolon inside a `--` comment cuts the statement it
+    /// sits in. Adding the word "durability;" to a column comment truncated a
+    /// `CREATE TABLE` mid-definition and every query against the database failed with a
+    /// syntax error pointing at a character offset.
+    ///
+    /// So comments are stripped before splitting, and the stripper respects single-quoted
+    /// literals so that a `--` inside one is left alone.
     static let schemaStatements: [String] = {
-        // Split on blank-line-separated statements would be fragile; the schema is
-        // embedded as discrete statements instead so migrate() stays a simple loop.
-        schemaSQL
+        splitStatements(schemaSQL)
+    }()
+
+    static func splitStatements(_ sql: String) -> [String] {
+        var stripped = ""
+        stripped.reserveCapacity(sql.count)
+        var inString = false
+        var inComment = false
+        var iterator = sql.startIndex
+
+        while iterator < sql.endIndex {
+            let character = sql[iterator]
+            let next = sql.index(after: iterator)
+
+            if inComment {
+                if character.isNewline {
+                    inComment = false
+                    stripped.append(character)
+                }
+                iterator = next
+                continue
+            }
+
+            if inString {
+                stripped.append(character)
+                // Doubled quotes are an escaped quote inside the literal, not its end.
+                if character == "'" {
+                    if next < sql.endIndex, sql[next] == "'" {
+                        stripped.append("'")
+                        iterator = sql.index(after: next)
+                        continue
+                    }
+                    inString = false
+                }
+                iterator = next
+                continue
+            }
+
+            if character == "'" {
+                inString = true
+                stripped.append(character)
+                iterator = next
+                continue
+            }
+
+            if character == "-", next < sql.endIndex, sql[next] == "-" {
+                inComment = true
+                iterator = sql.index(after: next)
+                continue
+            }
+
+            stripped.append(character)
+            iterator = next
+        }
+
+        return stripped
             .split(separator: ";", omittingEmptySubsequences: true)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && !$0.allSatisfy { c in c == "-" } }
-            .filter { stmt in
-                // Drop comment-only fragments.
-                stmt.split(separator: "\n").contains { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("--") }
-            }
-    }()
+            .filter { !$0.isEmpty }
+    }
 }
 
 extension Duration {
