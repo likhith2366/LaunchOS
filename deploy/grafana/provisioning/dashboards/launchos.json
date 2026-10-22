@@ -1,0 +1,304 @@
+{
+  "title": "LaunchOS",
+  "uid": "launchos-main",
+  "tags": ["launchos"],
+  "timezone": "browser",
+  "editable": true,
+  "refresh": "2s",
+  "time": { "from": "now-5m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "sku",
+        "label": "SKU",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(launchos_queue_depth, sku)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Correctness",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "Oversold units",
+      "description": "Must be zero. Anything else means the allocator sold a unit twice and every other number on this dashboard is irrelevant.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "sum(launchos_oversold_units) or vector(0)",
+          "legendFormat": "oversold"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Duplicate orders",
+      "description": "Orders beyond the first for one idempotency key. Must be zero.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 5, "y": 1 },
+      "targets": [
+        { "expr": "sum(launchos_duplicate_orders_total) or vector(0)", "legendFormat": "duplicates" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Purchases",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 7, "x": 10, "y": 1 },
+      "targets": [{ "expr": "sum(launchos_purchases_total)", "legendFormat": "purchased" }],
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Idempotent replays",
+      "description": "Retries answered from the stored response instead of being executed again. A healthy number here means duplicate suppression is doing real work.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 7, "x": 17, "y": 1 },
+      "targets": [
+        { "expr": "sum(launchos_idempotent_replays_total)", "legendFormat": "replayed" }
+      ],
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+
+    {
+      "type": "row",
+      "title": "Admission control",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Admission rate and queue depth",
+      "description": "The controller's output against the backlog it is draining. A sawtooth here means the dead band is too narrow or the signal is not smoothed enough.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "targets": [
+        { "expr": "launchos_admission_rate{sku=~\"$sku\"}", "legendFormat": "rate {{node}}" },
+        { "expr": "launchos_queue_depth{sku=~\"$sku\"}", "legendFormat": "queue depth {{node}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 5, "showPoints": "never" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "queue depth.*" },
+            "properties": [{ "id": "custom.axisPlacement", "value": "right" }]
+          }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Checkout latency",
+      "description": "p50, p95 and p99 from the server-side histogram. p99 is what the controller alarms on; it lags, which is why it is not what the controller acts on.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(launchos_checkout_duration_ms_bucket[30s])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(launchos_checkout_duration_ms_bucket[30s])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(launchos_checkout_duration_ms_bucket[30s])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" } }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "In-flight checkouts",
+      "description": "The leading indicator the controller acts on: it rises the moment service time increases, before latency percentiles have moved.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 15 },
+      "targets": [
+        { "expr": "launchos_inflight_checkouts{sku=~\"$sku\"}", "legendFormat": "{{node}}" },
+        { "expr": "sum(launchos_inflight_checkouts{sku=~\"$sku\"})", "legendFormat": "total" }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Admissions per second",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 15 },
+      "targets": [
+        {
+          "expr": "sum(rate(launchos_admitted_total{sku=~\"$sku\"}[15s]))",
+          "legendFormat": "admitted/s"
+        },
+        {
+          "expr": "sum(rate(launchos_purchases_total[15s]))",
+          "legendFormat": "purchased/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Inventory and sharding",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Shards probed per allocation",
+      "description": "One on a clean hit. Climbing means stock is fragmenting across shards and requests are having to look harder for it.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 23 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(launchos_allocation_probes_bucket{sku=~\"$sku\"}[30s])) by (le))",
+          "legendFormat": "p99 probes"
+        },
+        {
+          "expr": "sum(rate(launchos_allocation_probes_sum{sku=~\"$sku\"}[30s])) / sum(rate(launchos_allocation_probes_count{sku=~\"$sku\"}[30s]))",
+          "legendFormat": "mean probes"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" } }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Allocation failures",
+      "description": "Fragmented means stock existed but not on the shards that request probed — the cost of sharding. Sold out means there was genuinely nothing left. Keeping them apart is the whole point.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 23 },
+      "targets": [
+        {
+          "expr": "sum(rate(launchos_fragmentation_failures_total{sku=~\"$sku\"}[30s]))",
+          "legendFormat": "fragmented/s"
+        },
+        {
+          "expr": "sum(rate(launchos_soldout_total{sku=~\"$sku\"}[30s]))",
+          "legendFormat": "sold out/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Expiry sweeper",
+      "description": "Reservations returned to the pool, and how long a sweep batch takes. This is what stops a launch looking sold out while customers sit on reservations they never completed.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 23 },
+      "targets": [
+        {
+          "expr": "sum(rate(launchos_reservations_expired_total[30s]))",
+          "legendFormat": "reclaimed/s"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(launchos_sweep_duration_ms_bucket[60s])) by (le))",
+          "legendFormat": "sweep p99 (ms)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 0, "showPoints": "never" } }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Coordination",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Position cache",
+      "description": "Where am I in line? is the most frequent request in a launch. A high hit rate here is the difference between Redis absorbing it and Postgres counting the waiting set on every poll.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 31 },
+      "targets": [
+        {
+          "expr": "sum(rate(launchos_position_cache_hits_total[30s])) / clamp_min(sum(rate(launchos_position_cache_hits_total[30s])) + sum(rate(launchos_position_cache_misses_total[30s])), 0.001)",
+          "legendFormat": "hit rate"
+        },
+        { "expr": "sum(rate(launchos_redis_errors_total[30s]))", "legendFormat": "redis errors/s" }
+      ],
+      "fieldConfig": { "defaults": { "max": 1, "min": 0, "unit": "percentunit" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Admit statement cost",
+      "description": "What the fairness policy costs to evaluate. Ordering a large waiting set is not free, and this is where that shows up rather than in admissions per second.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 31 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(launchos_admit_statement_ms_bucket[60s])) by (le, policy))",
+          "legendFormat": "p99 {{policy}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Recovery",
+      "description": "Reservations reclaimed from nodes that stopped heartbeating, and in-flight idempotency keys released after their owner died. Non-zero means a node went away and the system noticed.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 31 },
+      "targets": [
+        {
+          "expr": "sum(increase(launchos_orphans_reclaimed_total[1m]))",
+          "legendFormat": "orphan reservations"
+        },
+        {
+          "expr": "sum(increase(launchos_abandoned_claims_released_total[1m]))",
+          "legendFormat": "abandoned claims"
+        },
+        {
+          "expr": "sum(increase(launchos_shard_collapses_total[1m]))",
+          "legendFormat": "shard collapses"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "auto" } }
+      }
+    }
+  ]
+}
