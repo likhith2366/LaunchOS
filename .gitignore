@@ -1,0 +1,20 @@
+# Swift
+.build/
+.swiftpm/
+*.xcodeproj
+.netrc
+
+# Node
+node_modules/
+dashboard/dist/
+
+# Results are generated. results.json and RESULTS.md are deliberately NOT ignored —
+# they are the record the README's numbers come from, and they belong in version
+# control. The run log and scratch output are not.
+results/run.log
+results/*.tmp
+
+# Local service data from scripts/wsl-services.sh (it writes under ~/.local, but just
+# in case someone points it here)
+pgdata/
+*.log
