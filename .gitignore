@@ -12,6 +12,7 @@ dashboard/dist/
 # they are the record the README's numbers come from, and they belong in version
 # control. The run log and scratch output are not.
 results/run.log
+results/bottleneck.txt
 results/*.tmp
 
 # Local service data from scripts/wsl-services.sh (it writes under ~/.local, but just
