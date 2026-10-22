@@ -246,13 +246,17 @@ public final class Store: Sendable {
     /// single snapshot rather than four successive ones. For the fragmentation
     /// measurement that is more honest, not less — "none of this customer's shards had
     /// stock" is now a statement about one instant.
+    ///
+    /// - Parameter skipLocked: whether a shard currently locked by another transaction is
+    ///   skipped or waited for. See `Allocator.reserve` for why both are needed.
     func probe(
         launchID: UUID,
         shardIDs: [Int],
         customerID: String,
         units: Int,
         ownerNode: String,
-        ttl: Duration
+        ttl: Duration,
+        skipLocked: Bool = true
     ) async throws -> Reservation? {
         guard !shardIDs.isEmpty else { return nil }
         let reservationID = UUID()
@@ -268,7 +272,10 @@ public final class Store: Sendable {
                    AND available >= \(units)
                  ORDER BY array_position(\(shardIDs), shard_id)
                  LIMIT 1
-                   FOR UPDATE SKIP LOCKED
+                   -- A literal chosen by the caller's Bool, never anything from a
+                   -- request; `unescaped` is the only way to vary a lock clause and it
+                   -- must never carry input.
+                   FOR UPDATE \(unescaped: skipLocked ? "SKIP LOCKED" : "")
             ),
             taken AS (
                 UPDATE inventory_shards i
