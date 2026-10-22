@@ -105,10 +105,41 @@ public final class Allocator: Sendable {
                     customerID: customerID, shardCount: launch.shardCount, limit: config.maxProbes
                 )
             totalProbes += shards.count
-            if let reservation = try await store.probe(
+            // Two passes over the same probe set, and the second one is not optional.
+            //
+            // The first pass skips shards another transaction currently holds, which is
+            // what keeps requests from queueing behind one hot row. But "every shard I
+            // was willing to try happened to be locked at that instant" is not a
+            // sell-out and it is not fragmentation — it is a request that would have
+            // succeeded a millisecond later. Reporting it as a failure loses a sale
+            // while stock is sitting there, and the first version of this did exactly
+            // that: half the customers in the concurrent-duplicates test were told the
+            // launch was sold out when it had plenty left.
+            //
+            // So the fallback waits instead of skipping. A request only fails after a
+            // pass that was willing to block found nothing, which means its shards were
+            // genuinely empty rather than momentarily busy. Cost is one extra
+            // round-trip, paid only under contention, against four for every request in
+            // the per-shard version this replaced.
+            var reservation = try await store.probe(
                 launchID: launchID, shardIDs: shards, customerID: customerID, units: units,
-                ownerNode: nodeID, ttl: launch.reservationTTL
-            ) {
+                ownerNode: nodeID, ttl: launch.reservationTTL, skipLocked: true
+            )
+            if reservation == nil {
+                reservation = try await store.probe(
+                    launchID: launchID, shardIDs: shards, customerID: customerID, units: units,
+                    ownerNode: nodeID, ttl: launch.reservationTTL, skipLocked: false
+                )
+                if reservation != nil {
+                    await MetricsRegistry.shared.increment(
+                        "launchos_probe_lock_waits_total", labels: ["sku": launch.sku],
+                        help:
+                            "Allocations that only succeeded once the probe was willing to wait "
+                            + "for a locked shard"
+                    )
+                }
+            }
+            if let reservation {
                 await MetricsRegistry.shared.observe(
                     "launchos_allocation_probes", Double(shards.count),
                     labels: ["sku": launch.sku],

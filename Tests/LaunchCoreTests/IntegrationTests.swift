@@ -213,6 +213,41 @@ struct AllocationIntegrationTests {
         #expect(state.available == 1)
     }
 
+    /// Contention must not be reported as a sell-out.
+    ///
+    /// The probe statement skips shards another transaction is holding, so that requests
+    /// spread out instead of queueing behind one row. On its own that turns a momentary
+    /// lock into an allocation failure: a request whose every shard happened to be busy
+    /// at that instant is told the launch is sold out while stock is sitting there. Few
+    /// shards and many concurrent requests is the shape that provokes it, and every unit
+    /// must still sell.
+    @Test("heavy contention on few shards still sells every unit")
+    func contentionDoesNotLoseSales() async throws {
+        let h = try await Harness()
+        defer { h.shutdown() }
+        let units = 40
+        // Deliberately far more concurrent requests than shards, so that at any instant
+        // most shards are locked by somebody.
+        let launch = try await h.makeLaunch(units: units, shards: 2)
+        let allocator = h.allocator(config: AllocatorConfig(maxProbes: 2, collapseEnabled: false))
+
+        var successes = 0
+        try await withThrowingTaskGroup(of: Bool.self) { group in
+            for i in 0..<units {
+                group.addTask {
+                    try await allocator.reserve(launchID: launch.id, customerID: "c\(i)").succeeded
+                }
+            }
+            for try await ok in group where ok { successes += 1 }
+        }
+
+        // Every request could have been satisfied, so every one must have been.
+        #expect(successes == units, "\(successes) of \(units) allocated; contention lost sales")
+        let state = try await h.store.assertInvariant(launchID: launch.id)
+        #expect(state.available == 0)
+        #expect(state.reserved == units)
+    }
+
     @Test("a sold-out launch allocates nothing")
     func soldOut() async throws {
         let h = try await Harness()
