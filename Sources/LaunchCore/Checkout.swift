@@ -353,6 +353,50 @@ public struct CheckoutCoordinator: Sendable {
         )
     }
 
+    /// Deletes idempotency records past their retention window.
+    ///
+    /// Nothing else ever removes a completed key, so without this the table grows for
+    /// the lifetime of the deployment — and it is the largest table in the system,
+    /// because every record carries the response body it exists to replay. Measured
+    /// mid-run at a million customers: 216 MB for 386,000 keys, about 560 bytes each,
+    /// against 101 MB for the orders they describe.
+    ///
+    /// The window is what decides how long a retry can still be answered from the
+    /// record rather than re-executed. Past it, a repeat of the same request is treated
+    /// as new — which is why the window has to outlive any client's retry behaviour by
+    /// a wide margin, and why a day is the usual choice rather than an hour.
+    ///
+    /// Deleted in bounded batches for the same reason the expiry sweeper is: a single
+    /// statement covering a week of keys holds locks proportional to the backlog.
+    @discardableResult
+    public func expireIdempotencyRecords(
+        olderThan retention: Duration,
+        batchSize: Int = 5_000
+    ) async throws -> Int {
+        let cutoff = Date().addingTimeInterval(-retention.seconds)
+        let rows = try await store.client.query(
+            """
+            DELETE FROM idempotency_keys
+             WHERE key IN (
+                 SELECT key FROM idempotency_keys
+                  WHERE state <> 'in_flight' AND created_at < \(cutoff)
+                  LIMIT \(batchSize)
+             )
+            RETURNING key
+            """,
+            logger: logger
+        )
+        var deleted = 0
+        for try await _ in rows.decode(String.self) { deleted += 1 }
+        if deleted > 0 {
+            await MetricsRegistry.shared.increment(
+                "launchos_idempotency_records_expired_total", by: Double(deleted),
+                help: "Idempotency records deleted past their retention window"
+            )
+        }
+        return deleted
+    }
+
     /// Clears in-flight keys left behind by a process that died mid-checkout.
     ///
     /// Without this, a customer whose request was being handled by the dead worker can

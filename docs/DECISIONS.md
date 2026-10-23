@@ -325,3 +325,188 @@ Prometheus and Grafana come up. `scripts/wsl-services.sh` exists because Docker 
 is a single point of failure for the whole loop on Windows, and a measurement run should
 not be blocked on it; it brings up Postgres and Redis from unpacked packages under
 `~/.local`, without root.
+
+---
+
+# Scaling to a million
+
+The entries above are from building the thing. These are from making it hold a million
+customers and a million-deep queue, which turned out to be a different kind of problem:
+not making any one operation faster, but removing operations whose cost grew with the
+data.
+
+---
+
+## 14. Queue position is estimated in constant time, not counted
+
+**Decision.** Each launch owns a Postgres sequence that hands out a dense
+`arrival_index` at join time. Departures are counted once per admitted *batch* in Redis.
+A position is `(arrival index − 1) − departed`.
+
+**What it replaced.** `SELECT count(*) WHERE launch_id = $1 AND state = 'waiting' AND
+seq < $2`. Exact, obvious, and O(the number of people ahead of you) — on the most
+frequent request in a launch. At a million waiting it walks up to a million index
+entries per poll, and a million people polling makes it the entire system. No cache
+downstream helps, because the cost is in the question.
+
+**Measured** (inside the node, both paths over the same rows, interleaved): flat at
+0.48–0.53 ms from a thousand to a million deep, against 1.19 ms → 85.6 ms for the count.
+177× at a million, and zero position error at every depth.
+
+**Why the sequence has to be per launch.** The first version derived the index from
+`seq`, the globally shared queue sequence, as `(my seq − the launch's first seq)`. That
+is dense only while one launch is taking joins — with several, their numbers interleave
+and the estimate drifts without bound. The test suite, which runs many launches at once,
+reported position 30 for the fourth customer in a queue of sixty. Sequences are
+non-transactional, so a sequence per launch costs no row lock to draw from, and Postgres
+is happy with thousands of them.
+
+**What it costs.** Accuracy, in two bounded ways, both documented on
+`PositionEstimator`: index gaps from rolled-back or conflicting joins make it read high,
+and out-of-order departures under a lottery policy make it read high at the back and low
+at the front. `?position=exact` always answers from the count, so the error is a measured
+number rather than a hope. This is also what real waiting rooms do — they show an
+approximate position, because the exact rank is both expensive and stale by the time it
+reaches the browser.
+
+---
+
+## 15. Continuous verification has to cost less than the thing it verifies
+
+**The bug, and it was mine.** `SelfCheck` ran the full invariant every five seconds,
+including a `SUM(units)` over every order and a join of orders against idempotency keys.
+Both are O(the table). As a launch grew the checker read more and more: at a quarter of a
+million orders it was reading about 900,000 rows from `orders` and 450,000 from
+`idempotency_keys` every twelve seconds. Allocation throughput fell from 814/s to roughly
+70/s. **The verifier was eating the system it was watching.**
+
+**The decision.** Split the checks by cost, not by importance:
+
+- Every tick: the arithmetic over `inventory_shards` — a handful of rows however large
+  the launch gets. This is the check that actually catches a double-sold unit.
+- Every two minutes: reconciling sold units against the orders table, and counting
+  duplicate orders per idempotency key. Both scan tables, and both are belt-and-braces —
+  `orders.reservation_id` is already unique, so a duplicate order per key cannot happen
+  without the unique constraint failing first.
+
+**Measured.** At 250,000 customers: 70 → 1084 allocations/s, checkout p99 2636 ms → 834
+ms. After the fix, zero sequential scans on the hot path, and the slowest query waiting
+on disk IO rather than on CPU.
+
+**The general lesson**, which is why this entry exists at all: verification that scales
+with the data will eventually cost more than the work it is checking. And the cheap half
+of a check is usually the half that catches the bug — the expensive half here was
+duplicating a guarantee a unique constraint already gave.
+
+---
+
+## 16. Writes are collapsed into single statements, carefully
+
+**Decision.** Checkout commit is one statement, not six round-trips. The shard probe
+offers its whole candidate set in one statement rather than one statement per shard.
+
+**Why.** Once sharding removed the row contention, throughput went flat while latency
+rose in proportion to concurrency — the signature of a saturated service spending its
+time on round-trips rather than on contention. A checkout cost nine round-trips; the
+success path is now three, measured at 1.31 Postgres transactions per request.
+
+**The dangerous part, and the distinction that makes it safe.** Collapsing writes into
+one statement caused the worst bug in this project (entry 3): sub-statements of a single
+statement cannot see each other's effects, so arithmetic that has to read what another
+part just wrote does not belong in one statement. The commit is safe because its four
+writes read from the same data-modifying CTE — which is exactly what those are for — and
+touch four different tables, so none of them can silently overwrite another.
+
+`releaseReservation` needed more care still. Returning a unit means decrementing
+`reserved` on one shard and incrementing `available` on another, and after a collapse
+those are the same row. Two CTEs updating one row do *not* both apply, so the naive form
+would silently lose half of every ordinary release. It is written as one update that
+folds both changes together when source and destination coincide, and a second update for
+the destination only when it differs — so every case touches each row exactly once.
+
+---
+
+## 17. SKIP LOCKED spreads load, but cannot be the only attempt
+
+**The bug.** The batched probe used `FOR UPDATE SKIP LOCKED` so requests would spread
+across shards instead of queueing behind one row. On its own that turns a momentary lock
+into an allocation failure: a request whose every candidate shard happened to be held at
+that instant was told the launch was sold out while stock was sitting there. Five of ten
+customers failed in a test against four times the stock they needed.
+
+**The decision.** Two passes over the same shard set. The first skips locked shards,
+which is what spreads the load. The second is willing to wait, so a request only fails
+after an attempt that would have blocked still found nothing — meaning its shards were
+genuinely empty rather than briefly busy. One extra round-trip, paid only under
+contention, against the four this replaced for every request.
+
+**Where SKIP LOCKED is still right, unchanged:** admitting from the queue. A skipped
+queue entry just means another admitter took that customer, and no sale is lost. The
+difference is whether skipping loses work or merely moves it.
+
+---
+
+## 18. The admission set caches only positive answers
+
+**Decision.** Admitted customers go into a Redis set, one `SADD` per admitted batch.
+Checkout checks the set before Postgres.
+
+**Why.** Checkout read Postgres on every request to ask whether this customer was let in
+— a hot-path query for a question the admitter already knew the answer to when it let
+them in.
+
+**The asymmetry is the safety property.** A hit was written by the admitter itself, so it
+is trustworthy. A miss means *nothing* — Redis may be cold, evicted or down — so it falls
+through to Postgres rather than turning a cache miss into a customer locked out of a
+launch they were admitted to. The function returns `Bool?` rather than `Bool` precisely so
+that "not admitted" and "don't know" cannot be confused at a call site.
+
+---
+
+## 19. The load generator is a worker pool, and reports how far behind it fell
+
+**Decision.** A bounded pool of workers pulling customers from a shared cursor in arrival
+order, instead of one task per customer. Customer scripts are derived from the seed and
+the customer's index rather than stored.
+
+**Why.** One task each is simpler and fine at six thousand. At a million it is a million
+live tasks, each holding a continuation and sleeping on its own arrival time, and the
+process spends its memory and its scheduler on bookkeeping rather than on load. Deriving
+the scripts keeps only the arrival offsets in memory: eight megabytes at a million instead
+of a few hundred. Peak RSS for a million-customer run is under 100 MB.
+
+**A side benefit worth more than the memory.** Behaviour used to come from one sequential
+RNG stream, so inserting a customer shifted every later customer's behaviour. Deriving it
+from the index means customer 500,000 behaves identically whether the run has a thousand
+customers or a million.
+
+**What it costs, and why it is reported.** A bounded pool can fall behind its own
+schedule: if every worker is busy when a customer was due, that customer starts late. So
+**arrival lag** is measured and reported. If it is large, the generator rather than the
+server was the limit, and the offered arrival rate is the rate that was asked for rather
+than the rate delivered. A benchmark that quietly falls behind is measuring its own
+harness, which is a worse failure than being slow.
+
+---
+
+## 20. Line endings and schema statements, or: an afternoon lost to punctuation
+
+Three small things that each broke the build in a way that took far too long to see.
+
+**Git was rewriting every file to CRLF on checkout.** The build and every script run
+under WSL, where a shell script with carriage returns fails as `set: pipefail: invalid
+option name` — the interpreter sees a trailing `\r`. Every commit also churned whole
+files on line endings alone. Fixed with `.gitattributes` pinning `* text=auto eol=lf`.
+
+**The schema loader split statements on `;`.** Which is wrong in a way that lies dormant
+until someone writes a semicolon inside a `--` comment — at which point it truncates the
+statement that comment sits in. Adding the word "durability;" to a column comment cut a
+`CREATE TABLE` in half, and every query against the database failed with a syntax error
+pointing at a character offset. The loader now strips comments before splitting, and
+respects single-quoted literals so a `--` inside one is left alone.
+
+**And the one that mattered most:** the schema was all `CREATE ... IF NOT EXISTS`, which
+creates a missing table but will never add a column to one that already exists. So there
+was no migration path at all — new columns simply never appeared on an existing database,
+and every query referencing them failed. Idempotent
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements now run on every boot.

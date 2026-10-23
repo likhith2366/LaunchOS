@@ -930,6 +930,65 @@ struct IdempotencyIntegrationTests {
         #expect(response.outcome == .purchased)
     }
 
+    /// Idempotency records are the largest table in the system and nothing else deletes
+    /// a completed one, so retention has to work — and has to leave in-flight records
+    /// alone, because deleting one of those would release a key whose owner is still
+    /// working and let a second order through.
+    @Test("retention deletes old records but never an in-flight one")
+    func retentionSweep() async throws {
+        let h = try await Harness()
+        defer { h.shutdown() }
+        let launch = try await h.makeLaunch(units: 10, shards: 1)
+        let checkout = coordinator(h)
+
+        let oldKey = key("retention-old")
+        let recentKey = key("retention-recent")
+        let inFlightKey = key("retention-inflight")
+        let fingerprint = "\(launch.id.uuidString):ghost:1"
+
+        // One completed record well past the window, one inside it, and one still in
+        // flight from before the window - the case that must survive.
+        for (name, age, state) in [
+            (oldKey, 7_200, "completed"),
+            (recentKey, 10, "completed"),
+            (inFlightKey, 7_200, "in_flight"),
+        ] {
+            _ = try await h.store.client.query(
+                """
+                INSERT INTO idempotency_keys
+                    (key, launch_id, customer_id, fingerprint, state, owner_node,
+                     created_at, updated_at)
+                VALUES (\(name), \(launch.id), 'ghost', \(fingerprint), \(state),
+                        'test-node',
+                        now() - make_interval(secs => \(Double(age))),
+                        now() - make_interval(secs => \(Double(age))))
+                """,
+                logger: silentLogger
+            )
+        }
+
+        let deleted = try await checkout.expireIdempotencyRecords(olderThan: .seconds(3_600))
+        #expect(deleted == 1, "deleted \(deleted) records; expected only the old completed one")
+
+        func exists(_ name: String) async throws -> Bool {
+            let rows = try await h.store.client.query(
+                "SELECT count(*)::bigint FROM idempotency_keys WHERE key = \(name)",
+                logger: silentLogger
+            )
+            for try await n in rows.decode(Int64.self) { return n > 0 }
+            return false
+        }
+
+        #expect(try await exists(oldKey) == false, "the old completed record survived")
+        #expect(try await exists(recentKey), "a record inside the window was deleted")
+        #expect(
+            try await exists(inFlightKey),
+            """
+            an in-flight record was deleted; its owner could still be working and a             second order could get through
+            """
+        )
+    }
+
     /// A worker that dies mid-checkout leaves its key in flight. Nothing may lock the
     /// customer out of their own order permanently.
     @Test("abandoned in-flight keys are recoverable")

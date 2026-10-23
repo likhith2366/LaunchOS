@@ -156,3 +156,8 @@ ALTER TABLE queue_entries ADD COLUMN IF NOT EXISTS arrival_index BIGINT NOT NULL
 CREATE INDEX IF NOT EXISTS orders_customer_idx ON orders (launch_id, customer_id);
 CREATE INDEX IF NOT EXISTS idempotency_launch_customer_idx
     ON idempotency_keys (launch_id, customer_id);
+
+-- Supports the idempotency retention sweep. Without it, finding expired records is a
+-- sequential scan of the largest table in the system.
+CREATE INDEX IF NOT EXISTS idempotency_retention_idx
+    ON idempotency_keys (created_at) WHERE state <> 'in_flight';
