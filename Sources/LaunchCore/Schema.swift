@@ -151,4 +151,12 @@ CREATE INDEX IF NOT EXISTS shard_leases_owner_idx ON shard_leases (launch_id, ow
 -- idempotent, so migrate() stays a loop that can run on every boot.
 ALTER TABLE launches ADD COLUMN IF NOT EXISTS queue_sequence TEXT;
 ALTER TABLE queue_entries ADD COLUMN IF NOT EXISTS arrival_index BIGINT NOT NULL DEFAULT 0;
+
+-- Supports the periodic duplicate-order reconciliation, which joins orders against
+-- idempotency keys on (launch, customer). Without these it is two sequential scans and
+-- a hash join over whole tables; the check is deliberately infrequent, but infrequent
+-- and unindexed still means a multi-hundred-megabyte read competing with a launch.
+CREATE INDEX IF NOT EXISTS orders_customer_idx ON orders (launch_id, customer_id);
+CREATE INDEX IF NOT EXISTS idempotency_launch_customer_idx
+    ON idempotency_keys (launch_id, customer_id);
 """

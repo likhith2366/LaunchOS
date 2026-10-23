@@ -69,7 +69,9 @@ died mid-checkout.
 | `CheckoutCoordinator` | `Sources/LaunchCore/Checkout.swift` | Idempotency ownership, commit, crash recovery. |
 | `Sweeper` / `CrashRecovery` | `Sources/LaunchCore/Sweeper.swift` | Reclaims expired and orphaned reservations. |
 | `LeaseManager` / `LeaseHolder` | `Sources/LaunchCore/Leases.swift` | Lease-based shard ownership with fence tokens. |
-| `Coordination` | `Sources/LaunchCore/Coordination.swift` | Redis: position cache, in-flight counters, node heartbeats. Never authoritative. |
+| `PositionEstimator` | `Sources/LaunchCore/Position.swift` | Queue position in constant time, from a dense arrival index and a departure counter. |
+| `PositionBenchmark` | `Sources/LaunchCore/PositionBenchmark.swift` | Times the estimate against the count it replaced, inside the node. |
+| `Coordination` | `Sources/LaunchCore/Coordination.swift` | Redis: position cache, admission set, departure counter, in-flight counters, node heartbeats. Never authoritative. |
 | `SelfCheck` | `Sources/LaunchCore/SelfCheck.swift` | Verifies the invariant on a timer in the running node. |
 | `MetricsRegistry` | `Sources/LaunchCore/Metrics.swift` | Prometheus exposition, plus the statistics the reports are built from. |
 | HTTP layer | `Sources/LaunchServer/` | Vapor routes, per-node wiring, background tasks. |
@@ -90,6 +92,91 @@ Actors are used where they are the right tool: the health monitor and the contro
 inherently stateful and sequential, and the registry of controllers is per-node
 bookkeeping, not per-request work.
 
+## What it takes to reach a million
+
+Three things stood between this and a million-person waiting room, and all three were
+about the *number of operations per request* rather than about how fast any one of them
+was.
+
+### The question that could not scale
+
+"How many people are ahead of me" is the most frequent request in a launch, and it was
+
+```sql
+SELECT count(*) FROM queue_entries
+ WHERE launch_id = $1 AND state = 'waiting' AND seq < $2
+```
+
+That is O(the number of people ahead of you). At a million waiting it walks up to a
+million index entries per poll, and a million people polling makes it the entire system.
+No cache downstream helps, because the cost is in the question.
+
+It is now arithmetic. Each launch owns a Postgres sequence that hands out a dense
+`arrival_index` at join time, and departures are counted once per admitted *batch* in
+Redis, so a position is `(arrival index − 1) − departed`. Measured inside the node, both
+paths over the same rows:
+
+| Queue depth | Estimated | Exact count | Speedup | Position error |
+| --- | --- | --- | --- | --- |
+| 1,000 | 0.48 ms | 1.19 ms | 2.5× | 0 |
+| 10,000 | 0.53 ms | 3.45 ms | 6.5× | 0 |
+| 100,000 | 0.52 ms | 24.0 ms | 46× | 0 |
+| 1,000,000 | 0.48 ms | 85.6 ms | **177×** | 0 |
+
+Flat across three orders of magnitude. The sequence has to be *per launch*: the first
+version derived the index from the globally shared `queue_seq`, which is only dense while
+one launch is taking joins — with several, their numbers interleave and the estimate
+drifts without bound.
+
+The estimate can be wrong, and the honest version of that is in the doc comment on
+`PositionEstimator`: index gaps from rolled-back joins make it read high, and
+out-of-order departures under a lottery policy make it read high at the back and low at
+the front. `?position=exact` always answers from the count, which is how the error stays
+a measured number.
+
+### Round-trips per request
+
+Once sharding removed the row contention, throughput went flat while latency rose in
+proportion to concurrency — a saturated service spending its time on round-trips. A
+checkout cost nine:
+
+| Step | Before | After |
+| --- | --- | --- |
+| Confirm admission | 1 (Postgres) | 0 on a Redis hit |
+| Claim the idempotency key | 1 | 1 |
+| Probe for a shard | up to 4, one per shard | 1, or 2 under contention |
+| Commit | 6 (BEGIN, three writes, key update, COMMIT) | 1 |
+
+The commit is one statement whose four writes all read from the same data-modifying CTE.
+That is safe here, and the distinction matters, because collapsing writes into one
+statement caused the worst bug in this project: sub-statements cannot see each other's
+effects, so arithmetic that has to read what another part just wrote does not belong in
+one statement. Here the four writes touch four different tables and none of them reads
+another's output.
+
+The batched probe needed a second pass. `FOR UPDATE SKIP LOCKED` spreads requests across
+shards instead of queueing them behind one row, but on its own it turns a momentary lock
+into an allocation failure — a request whose shards were all briefly busy was told the
+launch was sold out while stock sat there. The first pass skips, the second waits, so a
+request only fails if its shards were genuinely empty.
+
+### A load generator that could hold a million
+
+The simulator spawned one task per customer. Fine at six thousand; at a million it is a
+million live tasks each holding a continuation and sleeping on its own arrival time, and
+the process spends its memory and its scheduler on bookkeeping rather than on load.
+
+It is now a bounded worker pool pulling from a shared cursor in arrival order, and
+customer scripts are derived from the seed and the customer's index rather than stored —
+only the arrival offsets stay in memory, eight megabytes at a million instead of a few
+hundred. Deriving behaviour from the index also makes the determinism stronger: customer
+500,000 behaves identically whether the run has a thousand customers or a million.
+
+A bounded pool can fall behind its own schedule, so **arrival lag** is measured and
+reported. If it is large, the generator rather than the server was the limit, and the
+offered arrival rate is the rate that was asked for rather than the rate delivered. A
+benchmark that quietly falls behind is measuring its own harness.
+
 ## What each store guarantees
 
 **Postgres is the arbiter.** Every correctness claim reduces to a conditional update:
@@ -105,10 +192,21 @@ bookkeeping, not per-request work.
   only a retry counter.
 
 **Redis is a cache and is allowed to be wrong.** It holds queue positions (so the most
-frequent request in a launch does not reach Postgres), an advisory cross-node in-flight
+frequent request in a launch does not reach Postgres), the departure counter behind
+constant-time positions, the set of admitted customers, an advisory cross-node in-flight
 counter, and node heartbeats. Every read may miss or be stale; nothing consults it to
-make a decision. Killing it mid-launch costs latency, not correctness — that is one of
-the tests.
+make a decision it cannot also make from Postgres. Killing it mid-launch costs latency,
+not correctness — that is one of the tests.
+
+Two of those deserve their asymmetry spelled out, because both are read on the hot path:
+
+- The **admission set** caches only *positive* answers. A hit was written by the admitter
+  itself, so it is trustworthy. A miss means nothing — the cache may be cold, evicted or
+  down — so it falls through to Postgres rather than turning a cache miss into a customer
+  locked out of a launch they were admitted to.
+- The **departure counter** is allowed to drift. A lost increment makes positions read
+  high, which is the safe direction for someone waiting, and it is reconciled against a
+  count of the table on a slow timer.
 
 ## The crash window
 

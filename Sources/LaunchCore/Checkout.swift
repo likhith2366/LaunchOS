@@ -81,6 +81,9 @@ public struct CheckoutCoordinator: Sendable {
     let allocator: Allocator
     let room: WaitingRoom
     let health: HealthMonitor
+    /// Optional, so a coordinator can be built without Redis; the admission check then
+    /// always reads Postgres, which is slower and equally correct.
+    let coordination: Coordination?
     let nodeID: String
     let logger: Logger
     /// How long to wait for an in-flight duplicate before telling the client to retry.
@@ -95,6 +98,7 @@ public struct CheckoutCoordinator: Sendable {
         allocator: Allocator,
         room: WaitingRoom,
         health: HealthMonitor,
+        coordination: Coordination? = nil,
         nodeID: String,
         logger: Logger,
         inFlightWait: Duration = .milliseconds(250),
@@ -104,6 +108,7 @@ public struct CheckoutCoordinator: Sendable {
         self.allocator = allocator
         self.room = room
         self.health = health
+        self.coordination = coordination
         self.nodeID = nodeID
         self.logger = logger
         self.inFlightWait = inFlightWait
@@ -217,8 +222,21 @@ public struct CheckoutCoordinator: Sendable {
         enforceAdmission: Bool?
     ) async throws -> CheckoutResponse {
         if enforceAdmission ?? requireAdmission {
-            guard try await room.isAdmitted(launchID: request.launchID, customerID: request.customerID) else {
-                throw LaunchError.notAdmitted(request.customerID)
+            // Redis first. A positive answer came from the admitter itself, so it is
+            // trustworthy; anything else means "ask Postgres" rather than "turn them
+            // away", because a cold or unreachable cache must not lock out a customer
+            // who was genuinely admitted.
+            let cached = await coordination?.isAdmittedCached(
+                launchID: request.launchID, customerID: request.customerID
+            )
+            if cached != true {
+                guard
+                    try await room.isAdmitted(
+                        launchID: request.launchID, customerID: request.customerID
+                    )
+                else {
+                    throw LaunchError.notAdmitted(request.customerID)
+                }
             }
         }
 

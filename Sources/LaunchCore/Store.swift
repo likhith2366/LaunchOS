@@ -783,7 +783,15 @@ public final class Store: Sendable {
     // MARK: - Invariant
 
     /// The correctness assertion the whole project rests on, run against committed state.
-    public func assertInvariant(launchID: UUID) async throws -> InventoryState {
+    ///
+    /// - Parameter deep: also reconcile sold units against the orders table. That check
+    ///   is O(the number of orders), so it is off by default — see the note on
+    ///   `SelfCheck` for why continuous verification has to cost less than the thing it
+    ///   is verifying.
+    public func assertInvariant(
+        launchID: UUID,
+        deep: Bool = true
+    ) async throws -> InventoryState {
         let state = try await inventoryState(launchID: launchID)
         guard state.holds else {
             throw LaunchError.invariantViolated(
@@ -791,6 +799,17 @@ public final class Store: Sendable {
                     + "= \(state.accountedFor) != total(\(state.totalUnits))"
             )
         }
+        guard state.sold <= state.totalUnits else {
+            throw LaunchError.invariantViolated(
+                "oversold: sold(\(state.sold)) > total(\(state.totalUnits))"
+            )
+        }
+
+        // Everything above reads `inventory_shards`, which is a handful of rows however
+        // large the launch gets. What follows reads every order, so it does not belong on
+        // a timer that fires every few seconds.
+        guard deep else { return state }
+
         // Second, independent check: sold units must equal ordered units. The first
         // check can only catch arithmetic drift inside inventory_shards; this one
         // catches a unit that was marked sold without an order behind it.
@@ -802,9 +821,6 @@ public final class Store: Sendable {
         for try await n in rows.decode(Int64.self) { ordered = Int(n) }
         guard ordered == state.sold else {
             throw LaunchError.invariantViolated("sold(\(state.sold)) != ordered units(\(ordered))")
-        }
-        guard state.sold <= state.totalUnits else {
-            throw LaunchError.invariantViolated("oversold: sold(\(state.sold)) > total(\(state.totalUnits))")
         }
         return state
     }

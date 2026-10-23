@@ -84,9 +84,25 @@ struct WorkloadConfig: Sendable {
 /// customers duplicating and abandoning, and the same think times. That is what makes a
 /// failure replayable and a benchmark comparison fair — two admission policies see
 /// byte-identical traffic.
+///
+/// ## Why the scripts are generated rather than stored
+///
+/// At a million customers, materialising a `CustomerScript` each is a few hundred
+/// megabytes, almost all of it two heap-allocated strings per customer that are used
+/// once. Only the arrival offsets are kept — eight bytes each, so eight megabytes at a
+/// million — and everything else is derived on demand from the seed and the customer's
+/// index.
+///
+/// That also makes the determinism stronger rather than weaker. Behaviour used to come
+/// from one sequential RNG stream, so inserting a customer shifted every later
+/// customer's behaviour; deriving it from the index means customer 500,000 behaves the
+/// same way whether the run has a thousand customers or a million.
 struct Workload: Sendable {
     let config: WorkloadConfig
-    let scripts: [CustomerScript]
+    /// Sorted arrival offsets in seconds. The only per-customer state held in memory.
+    let offsets: [Double]
+
+    var count: Int { offsets.count }
 
     init(config: WorkloadConfig) {
         self.config = config
@@ -140,31 +156,37 @@ struct Workload: Sendable {
         }
         offsets.sort()
 
-        var scripts: [CustomerScript] = []
-        scripts.reserveCapacity(config.customers)
-        for i in 0..<config.customers {
-            let id = "c\(String(format: "%06d", i))"
-            scripts.append(
-                CustomerScript(
-                    customerID: id,
-                    arrivalOffset: i < offsets.count ? offsets[i] : 0,
-                    extraPolls: behaviourRNG.int(in: 0..<4),
-                    sendsDuplicate: behaviourRNG.bernoulli(config.duplicateRate),
-                    abandons: behaviourRNG.bernoulli(config.abandonRate),
-                    rejoinsQueue: behaviourRNG.bernoulli(config.rejoinRate),
-                    thinkTimeMS: behaviourRNG.uniform() * config.maxThinkTimeMS,
-                    salt: behaviourRNG.next(),
-                    // Stable across retries, which is the entire point: a retry carries
-                    // the key the first attempt used.
-                    idempotencyKey: "idem-\(id)-\(config.seed)"
-                )
-            )
-        }
-        self.scripts = scripts
+        _ = behaviourRNG
+        self.offsets = offsets
+    }
+
+    /// The script for one customer, derived rather than looked up.
+    ///
+    /// The RNG is seeded from the run seed mixed with the index, so this is a pure
+    /// function of the two: the same seed and index always produce the same customer,
+    /// and nothing has to be held in memory between generating them.
+    func script(at index: Int) -> CustomerScript {
+        let id = "c\(String(format: "%07d", index))"
+        // Mixed with a large odd constant so neighbouring indexes do not produce
+        // correlated streams, which they would if the index were simply added.
+        var rng = SplitMix64(seed: config.seed ^ (UInt64(index) &* 0x9E37_79B9_7F4A_7C15))
+        return CustomerScript(
+            customerID: id,
+            arrivalOffset: index < offsets.count ? offsets[index] : 0,
+            extraPolls: rng.int(in: 0..<4),
+            sendsDuplicate: rng.bernoulli(config.duplicateRate),
+            abandons: rng.bernoulli(config.abandonRate),
+            rejoinsQueue: rng.bernoulli(config.rejoinRate),
+            thinkTimeMS: rng.uniform() * config.maxThinkTimeMS,
+            salt: rng.next(),
+            // Stable across retries, which is the entire point: a retry carries the key
+            // the first attempt used.
+            idempotencyKey: "idem-\(id)-\(config.seed)"
+        )
     }
 
     var arrivalRate: Double {
-        let span = scripts.last?.arrivalOffset ?? 0
-        return span > 0 ? Double(scripts.count) / span : Double(scripts.count)
+        let span = offsets.last ?? 0
+        return span > 0 ? Double(offsets.count) / span : Double(offsets.count)
     }
 }

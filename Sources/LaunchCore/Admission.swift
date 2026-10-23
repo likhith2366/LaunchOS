@@ -195,6 +195,9 @@ public actor AdmissionController {
     private let room: WaitingRoom
     /// Told about each admitted batch, so queue positions can move without counting.
     private let positions: PositionEstimator?
+    /// Told about each admitted batch, so checkout can confirm admission without reading
+    /// Postgres.
+    private let coordination: Coordination?
     private let launchID: UUID
     private let sku: String
     private let logger: Logger
@@ -214,6 +217,7 @@ public actor AdmissionController {
         health: HealthMonitor,
         room: WaitingRoom,
         positions: PositionEstimator? = nil,
+        coordination: Coordination? = nil,
         launchID: UUID,
         sku: String,
         seed: UInt64 = 0x5EED,
@@ -223,6 +227,7 @@ public actor AdmissionController {
         self.health = health
         self.room = room
         self.positions = positions
+        self.coordination = coordination
         self.launchID = launchID
         self.sku = sku
         self.rate = config.initialRate
@@ -286,6 +291,11 @@ public actor AdmissionController {
         // One counter increment per batch, which is what keeps the poll path from
         // having to count anybody.
         await positions?.recordDepartures(launchID: launchID, count: admitted.count)
+        // And one SADD per batch, which is what keeps checkout from reading Postgres
+        // just to ask a question this loop already answered.
+        await coordination?.markAdmitted(
+            launchID: launchID, customerIDs: admitted.map(\.customerID)
+        )
 
         await MetricsRegistry.shared.set(
             "launchos_admission_rate", to: rate, labels: ["sku": sku],

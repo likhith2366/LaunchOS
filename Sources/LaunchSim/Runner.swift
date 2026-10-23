@@ -70,6 +70,16 @@ struct RunOutcome: Sendable, Codable {
     /// this, not just the server's latency.
     var completionRate: Double
     var errorRate: Double
+    /// How far behind its own schedule the load generator ran, in milliseconds.
+    ///
+    /// Zero means every customer started when the arrival process said they should. A
+    /// large figure means the generator, not the server, was the limit — and that the
+    /// offered arrival rate reported above is the rate that was asked for rather than
+    /// the rate that was delivered. Reported because a benchmark that silently fell
+    /// behind is a benchmark measuring its own harness.
+    var arrivalLagP50MS: Double
+    var arrivalLagP99MS: Double
+    var arrivalLagMaxMS: Double
     var inventory: InventorySummary
     var errorSamples: [String]
 }
@@ -168,20 +178,47 @@ struct Runner: Sendable {
             }
             : nil
 
+        // A bounded pool of workers, not one task per customer.
+        //
+        // One task each is simpler and works fine at six thousand. At a million it is
+        // a million live tasks, each holding a continuation and sleeping on its own
+        // arrival time, and the process spends its memory and its scheduler on
+        // bookkeeping rather than on load. The pool keeps live tasks at `workers` and
+        // pulls customers from a shared cursor in arrival order.
+        //
+        // The cost is that the generator can fall behind: if every worker is busy when
+        // a customer was due, that customer starts late. That is real — it is what
+        // happens to any load generator pushed past its own capacity — and it is
+        // dangerous to leave unmeasured, because a run that fell ten seconds behind
+        // schedule did not offer the arrival rate it claims to have offered. So the lag
+        // is recorded and reported, and a run whose lag is large is a run whose offered
+        // rate is the generator's limit rather than the configured one.
+        let cursor = ArrivalCursor(total: workload.count)
+        let lag = LagCollector()
+        let workers = max(1, min(config.connectionLimit, workload.count))
         await withTaskGroup(of: Void.self) { group in
-            for script in workload.scripts {
+            for _ in 0..<workers {
                 group.addTask {
-                    // Each customer waits out its own arrival offset, so the shape of
-                    // the arrival process is reproduced in real time rather than fired
-                    // all at once and relabelled.
-                    let delayNS = UInt64(max(0, script.arrivalOffset) * 1_000_000_000)
-                    if delayNS > 0 { try? await Task.sleep(nanoseconds: delayNS) }
-                    let result = await runCustomer(script, gate: gate)
-                    await collector.add(result)
+                    while let index = await cursor.next() {
+                        let script = workload.script(at: index)
+                        // Measured against the run's own start, so arrival times are
+                        // absolute rather than accumulating per-customer drift.
+                        let due = started.advanced(by: .seconds(script.arrivalOffset))
+                        let now = ContinuousClock.now
+                        if due > now {
+                            try? await Task.sleep(for: due - now)
+                            await lag.record(0)
+                        } else {
+                            await lag.record(now.duration(to: due).milliseconds * -1)
+                        }
+                        let result = await runCustomer(script, gate: gate)
+                        await collector.add(result)
+                    }
                 }
             }
             await group.waitForAll()
         }
+        let arrivalLag = await lag.samples()
 
         tickTask?.cancel()
         let wallClock = started.duration(to: .now).seconds
@@ -197,6 +234,7 @@ struct Runner: Sendable {
         let outcome = summarize(
             results: results,
             workload: workload,
+            arrivalLag: arrivalLag,
             peak: await gate.peak,
             wallClock: wallClock,
             inventory: inventory
@@ -362,6 +400,7 @@ struct Runner: Sendable {
     private func summarize(
         results: [CustomerResult],
         workload: Workload,
+        arrivalLag: Samples,
         peak: Int,
         wallClock: Double,
         inventory: InventoryInfo
@@ -413,6 +452,9 @@ struct Runner: Sendable {
             maxProbes: probeMax,
             completionRate: attempted > 0 ? Double(purchases) / Double(attempted) : 0,
             errorRate: results.isEmpty ? 0 : Double(errors) / Double(results.count),
+            arrivalLagP50MS: arrivalLag.p50,
+            arrivalLagP99MS: arrivalLag.p99,
+            arrivalLagMaxMS: arrivalLag.max,
             inventory: InventorySummary(inventory),
             errorSamples: samples
         )
@@ -438,4 +480,30 @@ actor ResultCollector {
     private var results: [CustomerResult] = []
     func add(_ r: CustomerResult) { results.append(r) }
     func all() -> [CustomerResult] { results }
+}
+
+
+/// Hands out customer indexes in arrival order to a fixed pool of workers.
+actor ArrivalCursor {
+    private var next_ = 0
+    private let total: Int
+
+    init(total: Int) { self.total = total }
+
+    func next() -> Int? {
+        guard next_ < total else { return nil }
+        defer { next_ += 1 }
+        return next_
+    }
+}
+
+/// Collects how late each customer started against the arrival process.
+actor LagCollector {
+    private var lag = Samples()
+
+    func record(_ milliseconds: Double) {
+        lag.add(max(0, milliseconds))
+    }
+
+    func samples() -> Samples { lag }
 }
