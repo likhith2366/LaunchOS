@@ -59,6 +59,43 @@ func configure(_ app: Application) async throws {
     // "oversold units" on the dashboard is something the running system checked rather
     // than something a test asserted once.
     let selfCheckTask = Task { await node.selfCheck.run() }
+    // Idempotency records are the largest table in the system and nothing else removes
+    // a completed one, so retention runs on its own slow timer. The window has to
+    // outlive any client's retry behaviour by a wide margin: past it, a repeat of the
+    // same request is treated as new rather than replayed.
+    let retentionTask = Task {
+        let window = Duration.seconds(
+            Double(ProcessInfo.processInfo.environment["IDEMPOTENCY_RETENTION_SECONDS"] ?? "86400")
+                ?? 86_400
+        )
+        while !Task.isCancelled {
+            do {
+                var deleted = 0
+                // Bounded batches, repeated while there is a full batch to take, for the
+                // same reason the expiry sweeper is batched: one statement covering a
+                // week of keys holds locks proportional to the backlog.
+                while !Task.isCancelled {
+                    let batch = try await node.checkout.expireIdempotencyRecords(
+                        olderThan: window
+                    )
+                    deleted += batch
+                    if batch < 5_000 { break }
+                }
+                if deleted > 0 {
+                    node.logger.info(
+                        "expired idempotency records",
+                        metadata: ["count": .stringConvertible(deleted)]
+                    )
+                }
+            } catch {
+                node.logger.error(
+                    "idempotency retention failed", metadata: ["error": .string("\(error)")]
+                )
+            }
+            try? await Task.sleep(for: .seconds(300))
+        }
+    }
+
     let heartbeatTask = Task {
         while !Task.isCancelled {
             await node.coordination.heartbeat(nodeID: node.nodeID)
@@ -68,7 +105,8 @@ func configure(_ app: Application) async throws {
 
     app.lifecycle.use(
         BackgroundWork(
-            tasks: [storeTask, sweeperTask, heartbeatTask, selfCheckTask], node: node
+            tasks: [storeTask, sweeperTask, heartbeatTask, selfCheckTask, retentionTask],
+            node: node
         )
     )
 

@@ -25,6 +25,7 @@ struct ExperimentSuite: Codable, Sendable {
     var idempotency: IdempotencyResult?
     var sweepStrategy: SweepStrategyResult?
     var commitHorizon: HorizonResult?
+    var positionScale: PositionScaleResult?
 }
 
 // MARK: - Shared setup

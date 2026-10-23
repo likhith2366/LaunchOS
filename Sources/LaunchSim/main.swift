@@ -481,6 +481,23 @@ struct All: AsyncParsableCommand {
                 print(String(format: "  horizon %5.0f ms: %d inversions of %d", p.horizonMS, p.fifoInversions, p.admissionsChecked))
             }
 
+            print("== queue position at scale ==")
+            // Depths scale with the run so a constrained machine still gets the shape;
+            // a million seeded rows is about 170MB and a couple of minutes.
+            let positionDepths = [1_000, 10_000, 100_000, n(1_000_000)].filter { $0 >= 1_000 }
+            suite.positionScale = try await runPositionScale(
+                client: client, depths: Array(Set(positionDepths)).sorted(), iterations: 25
+            )
+            for point in suite.positionScale!.points {
+                print(
+                    String(
+                        format: "  depth %8d: estimated %.3fms vs exact %.3fms (%.1fx), error %d",
+                        point.queueDepth, point.estimatedMedianMS, point.exactMedianMS,
+                        point.speedup, point.positionError
+                    )
+                )
+            }
+
             print("== expiry sweep ==")
             suite.sweepStrategy = try await runSweepProbe(
                 client: client, units: n(5_000), abandoners: n(3_000),

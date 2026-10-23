@@ -289,6 +289,28 @@ struct ReportWriter {
             }
         }
 
+        if let p = suite.positionScale {
+            out += """
+
+                ## Scaling the waiting room: queue position against depth
+
+                "How many people are ahead of me" is the most frequent request in a                 launch, and counting them is O(the number of people ahead of you). At a                 million waiting that is the whole system, and no cache downstream helps,                 because the cost is in the question.
+
+                Position is now arithmetic on a dense per-launch arrival index and a                 departure counter. Both paths measured inside the node, over the same                 rows, interleaved in the same call:
+
+                | Queue depth | Estimated | Exact count | Speedup | Exact p99 | Position error |
+                | --- | --- | --- | --- | --- | --- |
+
+                """
+            for point in p.points {
+                out += "| \(point.queueDepth) | \(f(point.estimatedMedianMS, 2)) ms | "
+                out += "\(f(point.exactMedianMS, 2)) ms | **\(f(point.speedup, 1))x** | "
+                out += "\(f(point.exactP99MS, 2)) ms | \(point.positionError) "
+                out += "(\(f(point.positionErrorPercent, 4))%) |\n"
+            }
+            out += "\n\(prose(p.explanation))\n"
+        }
+
         if let s = suite.sweepStrategy {
             out += """
 

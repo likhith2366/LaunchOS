@@ -236,6 +236,37 @@ def build(data: dict) -> list[str]:
 
     # Fields added as the experiments were refined, so read defensively: an older
     # results.json should degrade to a smaller table rather than crash the generator.
+    scale = data.get("positionScale")
+    if scale and scale.get("points"):
+        deepest = max(scale["points"], key=lambda q: q["queueDepth"])
+        out += [
+            "### Scaling the waiting room",
+            "",
+            '"How many people are ahead of me" is the most frequent request in a launch, '
+            "and counting them is O(the number of people ahead of you). At a million "
+            "waiting that is the whole system, and nothing downstream helps because the "
+            "cost is in the question. Position is now arithmetic on a dense per-launch "
+            "arrival index and a departure counter. Both paths measured inside the node, "
+            "over the same rows, interleaved in the same call:",
+            "",
+            "| Queue depth | Estimated | Exact count | Speedup | Position error |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for point in scale["points"]:
+            out.append(
+                f"| {point['queueDepth']:,} | {point['estimatedMedianMS']:.2f} ms | "
+                f"{point['exactMedianMS']:.2f} ms | **{point['speedup']:.1f}x** | "
+                f"{point['positionError']} |"
+            )
+        out += [
+            "",
+            f"Flat across the range; the count grows linearly, as it must. At a depth of "
+            f"{deepest['queueDepth']:,} the count costs {deepest['exactMedianMS']:.0f} ms "
+            "of a Postgres core per poll, so one core answers roughly "
+            f"{1000 / deepest['exactMedianMS']:.0f} of them per second.",
+            "",
+        ]
+
     sweeper = data.get("sweepStrategy")
     if sweeper:
         out += [

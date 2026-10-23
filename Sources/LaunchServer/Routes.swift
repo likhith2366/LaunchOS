@@ -83,6 +83,7 @@ func routes(_ app: Application) throws {
             let config = admission.config()
             let controller = AdmissionController(
                 config: config, health: n.health, room: n.room, positions: n.positions,
+                coordination: n.coordination,
                 launchID: launch.id, sku: launch.sku, logger: n.logger
             )
             await n.controllers.replace(launch.id, with: controller)

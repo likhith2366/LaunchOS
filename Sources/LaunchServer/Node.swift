@@ -60,7 +60,7 @@ final class Node: Sendable {
         )
         self.checkout = CheckoutCoordinator(
             store: store, allocator: allocator, room: room, health: health,
-            nodeID: nodeID, logger: logger,
+            coordination: coordination, nodeID: nodeID, logger: logger,
             requireAdmission: env["REQUIRE_ADMISSION"] != "0"
         )
         let sweepStrategy = SweepStrategy(rawValue: env["SWEEP_STRATEGY"] ?? "") ?? .bucketed

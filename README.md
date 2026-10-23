@@ -177,6 +177,24 @@ tested: Postgres as the arbiter (correct, contended) and lease-based shard owner
 fence tokens (less contention, reclaim latency after a node death). The published numbers
 below are from a single node, though — see the honest notes at the end.
 
+## Reaching a million
+
+The first version of this handled thousands. Getting to a million was not about making
+any one operation faster — it was about removing operations whose cost grew with the
+data:
+
+| What | Was | Is |
+| --- | --- | --- |
+| Queue position | `count(*)` over everyone ahead — O(depth) | arithmetic on a dense arrival index and a departure counter — O(1) |
+| Checkout commit | 6 round-trips (`BEGIN`, 3 writes, key update, `COMMIT`) | 1 statement |
+| Shard probe | up to 4 round-trips, one per shard | 1, or 2 under contention |
+| Admission check | a Postgres read per checkout | a Redis set lookup, falling through to Postgres on a miss |
+| Invariant self-check | 2 O(table) scans every 5s | O(shards) every 5s, table scans every 2 minutes |
+| Load generator | one task per customer | bounded worker pool, scripts derived from seed + index |
+
+The details, and what each one cost to get right, are in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#what-it-takes-to-reach-a-million).
+
 ## The hot row
 
 The obvious allocator is one row per SKU and a conditional update:
@@ -435,6 +453,27 @@ Kept because the project is not worth much without them.
   measured**. The machinery to measure it exists (`NODES=3 scripts/run-experiments.sh`,
   `MULTI_NODE_MODE=leasedShards`); the number does not, and it would be dishonest to
   quote one.
+- **"A million" means a million customers through the allocator, and a million-deep
+  queue — not a million concurrent connections.** The load generator runs a bounded
+  worker pool, so it offers load at a rate the machine can sustain rather than opening a
+  million sockets. It reports **arrival lag** for exactly this reason: if the generator
+  fell behind its own schedule, the offered arrival rate is the rate that was asked for
+  rather than the rate delivered, and the run is partly measuring its own harness.
+- **The queue-depth measurement seeds rows in bulk rather than joining over HTTP.** Depth
+  is the independent variable there; how long a million HTTP joins take is a different
+  question, and the throughput runs answer that one.
+- **The position estimate can be wrong, and by how much is measured, not assumed.** Index
+  gaps from rolled-back joins make it read high; out-of-order departures under a lottery
+  policy make it read high at the back of the queue and low at the front.
+  `?position=exact` always answers from the count, which is how the error stays a number.
+  It measured zero at every depth tested, which is the dense per-launch arrival sequence
+  working — deriving the index from the globally shared sequence drifted without bound.
+- **The biggest scale bug in here was this project's own monitoring.** Continuous
+  invariant verification ran two O(table) queries every five seconds, so as a launch grew
+  the checker read more and more and throughput fell from 814 allocations/s to about 70.
+  The lesson generalises past this codebase: verification that scales with the data will
+  eventually cost more than the work it is checking, and the cheap half of a check is
+  usually the half that catches the bug.
 - **Single machine, single Postgres.** Every number is from one 8-core WSL2 host with the
   database, Redis, the allocator node and the load generator all on it, competing for the
   same eight cores. The shapes are real; the absolute figures are a laptop's.

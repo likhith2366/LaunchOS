@@ -156,6 +156,69 @@ public final class Coordination: Sendable {
         }
     }
 
+    // MARK: - Admission set
+
+    /// Who has been admitted to a launch, as a Redis set.
+    ///
+    /// Checkout has to know whether this customer was let in, and that was a Postgres
+    /// read on every checkout — on the hot path, for a question the admitter already
+    /// knew the answer to when it let them in.
+    ///
+    /// A set rather than a key each, for two reasons: one `SADD` records a whole
+    /// admitted batch in a single round-trip, and the whole set expires together
+    /// instead of leaving a million keys to tidy up.
+    ///
+    /// Only *positive* answers are cached, and that asymmetry is the safety property. A
+    /// hit means the admitter put this customer here, so it is trustworthy. A miss means
+    /// nothing at all — Redis may be cold, evicted or down — so it falls through to
+    /// Postgres rather than turning a cache miss into a locked-out customer.
+    private func admittedKey(_ launchID: UUID) -> RedisKey {
+        RedisKey("launchos:admitted:\(launchID.uuidString)")
+    }
+
+    public func markAdmitted(
+        launchID: UUID,
+        customerIDs: [String],
+        ttl: Duration = .seconds(3600)
+    ) async {
+        guard let pool, !customerIDs.isEmpty else { return }
+        do {
+            let key = admittedKey(launchID)
+            _ = try await pool.sadd(customerIDs, to: key).get()
+            // Refreshed on every batch, so the set outlives the launch it describes
+            // rather than expiring under a queue that is still draining.
+            _ = try await pool.expire(key, after: .seconds(Int64(max(1, ttl.seconds)))).get()
+        } catch {
+            await MetricsRegistry.shared.increment("launchos_redis_errors_total")
+        }
+    }
+
+    /// True when Redis knows this customer was admitted; nil when it does not know.
+    ///
+    /// Never returns false. "Not in the set" and "Redis could not answer" are the same
+    /// thing from here, and both have to mean "ask Postgres".
+    public func isAdmittedCached(launchID: UUID, customerID: String) async -> Bool? {
+        guard let pool else { return nil }
+        do {
+            let member = try await pool.sismember(customerID, of: admittedKey(launchID)).get()
+            if member {
+                await MetricsRegistry.shared.increment(
+                    "launchos_admission_cache_hits_total",
+                    help: "Checkouts whose admission was confirmed from Redis"
+                )
+                return true
+            }
+            await MetricsRegistry.shared.increment(
+                "launchos_admission_cache_misses_total",
+                help: "Checkouts that had to confirm admission in Postgres"
+            )
+            return nil
+        } catch {
+            await MetricsRegistry.shared.increment("launchos_redis_errors_total")
+            return nil
+        }
+    }
+
     // MARK: - Queue departure counter
 
     /// Customers who have left the waiting room for a launch, across all nodes.
