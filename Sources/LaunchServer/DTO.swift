@@ -238,3 +238,24 @@ struct RecoveryView: Content {
     var reservationsReclaimed: Int
     var claimsReleased: Int
 }
+
+struct SeedQueueBody: Content {
+    var count: Int
+    var prefix: String?
+}
+
+struct SeedQueueView: Content {
+    var inserted: Int
+    var queueDepth: Int
+}
+
+struct PositionBenchmarkBody: Content {
+    /// Defaults to the customer at the back of the queue, which is the worst case for
+    /// the count the estimate replaces.
+    var customerID: String?
+    var iterations: Int?
+}
+
+struct PositionBenchmarkView: Content {
+    var result: PositionBenchmarkResult
+}

@@ -1102,3 +1102,74 @@ func runHorizonSweep(
             """
     )
 }
+
+// MARK: - 9. Queue position at scale
+
+struct PositionScaleResult: Codable, Sendable {
+    var depths: [Int]
+    var points: [PositionBenchmarkResult]
+    var explanation: String
+}
+
+/// Measures what a queue position costs as the queue gets deeper.
+///
+/// This is the measurement that decides whether a million-person waiting room is
+/// answerable. "How many people are ahead of me" is the most frequent request in a
+/// launch, and counting them is O(queue depth) — so at a million waiting, each poll
+/// walks up to a million index entries, and a million people polling makes that the
+/// whole system. Nothing downstream helps, because the cost is in the question.
+///
+/// The queue is seeded in bulk rather than joined over HTTP: depth is the independent
+/// variable here, and how long a million joins take is a separate experiment that runs
+/// over HTTP like a real customer would.
+func runPositionScale(
+    client: LaunchClient,
+    depths: [Int],
+    iterations: Int
+) async throws -> PositionScaleResult {
+    let sku = "position-scale"
+    _ = try await prepareLaunch(
+        client: client, sku: sku, units: 1_000, shardCount: 16, collapseThreshold: 0,
+        // A waiting room, but admitting almost nobody: departures would move the queue
+        // underneath the measurement and the two paths would be answering about
+        // different queues.
+        admission: admissionRequest(
+            kind: .fixed, policy: .strictFIFO, rate: 0.0001, intervalMS: 60_000
+        ),
+        ttlSeconds: 600
+    )
+
+    var points: [PositionBenchmarkResult] = []
+    for depth in depths.sorted() {
+        let seeded = try await client.seedQueue(sku: sku, count: depth)
+        guard let seeded, seeded.queueDepth >= depth else {
+            throw ClientError(
+                status: 0, body: "seeding \(sku) to \(depth) left depth \(seeded?.queueDepth ?? -1)"
+            )
+        }
+        guard let point = try await client.positionBenchmark(sku: sku, iterations: iterations) else {
+            throw ClientError(status: 0, body: "no benchmark result at depth \(depth)")
+        }
+        points.append(point)
+    }
+
+    let deepest = points.last
+    return PositionScaleResult(
+        depths: depths.sorted(),
+        points: points,
+        explanation: """
+            The estimated column should stay flat as depth grows and the exact column \
+            should not, because one is arithmetic on two counters and the other walks \
+            everyone ahead of you. Both are measured inside the node over the same rows \
+            in the same call, interleaved, so neither gets a warmer cache or a different \
+            queue depth than the other — and timing them from a client would have \
+            compared two numbers that are mostly network.
+
+            Error is the estimate's distance from the count it replaced, in queue \
+            places\(deepest.map { ": \($0.positionError) at a depth of \($0.queueDepth)" } ?? ""). \
+            It comes from gaps in the arrival index, which a rolled-back or conflicting \
+            join leaves behind, and those make a position read high rather than low — \
+            the safe direction to be wrong in for somebody waiting.
+            """
+    )
+}
