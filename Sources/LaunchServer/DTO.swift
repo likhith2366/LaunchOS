@@ -133,6 +133,10 @@ struct CheckoutBody: Content {
     var customerID: String
     var units: Int?
     var idempotencyKey: String
+    /// Take the unit and record the order in one statement, for a sale with no payment
+    /// step between reserving and committing. Absent means the two-phase flow, which is
+    /// what a sale with a payment authorisation needs.
+    var singlePhase: Bool?
 }
 
 struct CheckoutView: Content {

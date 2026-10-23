@@ -510,3 +510,89 @@ creates a missing table but will never add a column to one that already exists. 
 was no migration path at all — new columns simply never appeared on an existing database,
 and every query referencing them failed. Idempotent
 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements now run on every boot.
+
+---
+
+## 21. Allocation throughput: what worked, what did not, and how I nearly fooled myself
+
+Asked to make the allocation number impressive, I attacked the ceiling the earlier
+measurements pointed at — commit durability and round-trips per sale. Most of it failed,
+and the way it failed is the useful part.
+
+**First, the measurement was not good enough to tell.** Five repeated runs of the same
+workload on the same configuration returned 1090, 862, 1049, 881 and 602 allocations/s:
+a **55% spread**. Every single-run comparison I had made that session was inside that
+band and therefore meaningless. Two causes:
+
+- Runs were not isolated. Each inherited its predecessor's dead tuples and WAL state, so
+  the sequence drifted downward. Vacuuming and checkpointing before each run cut the
+  spread to 24%.
+- The deep half of the invariant check scans whole tables every two minutes, and a run
+  takes about forty seconds — so it landed inside some runs and not others. That showed
+  up as a cleanly **bimodal** distribution, half the runs near 880/s and half near
+  1450/s. Making the interval configurable and turning it up collapsed the two modes
+  into one and cut the spread to 23%.
+
+Nothing below is claimed unless it clears that floor, and `scripts/bench-repeat.sh`
+exists so the floor is reported next to every number.
+
+**Group commit made it worse.** `commit_delay` is the textbook answer when the slowest
+query in a saturated run is waiting on IO, which this one was. Measured: 969
+allocations/s without it, 730 with it plus `wal_compression`. The fsyncs were evidently
+already batched effectively, so the delay was pure latency on the critical path — and a
+sale commits two or three times, so it paid that delay over and over. Both settings are
+now explicitly off with the reasoning beside them, because they are the first thing
+anyone will suggest.
+
+**Removing write-taxing indexes was within noise, but was right anyway.** Three indexes
+had been added to speed up maintenance running every few minutes. On a write-heavy run
+they showed **zero or one scan** while occupying 7.7MB for 40,000 rows — and every one
+of those entries is a WAL-logged insert on every single write. WAL per sale fell from
+3060 to 2627 bytes (-14%), which is below the noise floor for throughput, so no speed
+claim is made. The index on retention turned out to be unnecessary for a better reason:
+records are inserted in time order, so a sequential scan with the sweep's `LIMIT` stops
+as soon as it has a batch. The general rule is worth keeping: **an index serving a rare
+query is paid for on every write.**
+
+**What did work was understanding a trade, not turning a knob.**
+
+A sale costs three commits: claim the key, take the unit, record the order. For a sale
+with no payment step between reserving and committing, the last two have nothing to
+separate them, so `takeAndRecord` merges them — two commits instead of three.
+
+On its own that was *slower*: 852 against 969 allocations/s at sixteen shards. The
+merged statement holds the shard row lock across three more writes, and on a contended
+row that costs more than the round-trip it saves. But at sixty-four shards, where
+contention is spread, the same change is faster — and the combination beats either:
+
+| | 16 shards | 64 shards |
+| --- | --- | --- |
+| two-phase, 3 commits | 969/s | 957/s |
+| single-phase, 2 commits | 852/s | **1298/s** |
+
+**969 → 1298 allocations/s, +34%**, and it clears the 23% floor. Best individual runs
+reached 1479/s with p99 234ms. Median p99 did not improve reliably and no claim is made
+about it.
+
+The lesson is the interaction. Fewer round-trips and less lock contention are both good,
+and pursuing one in isolation made things worse, because merging statements trades
+round-trips *for* lock hold time. Which way the trade goes depends on how contended the
+row is — so the right shard count is not a property of the workload alone, it depends on
+how the writes are batched. That is not something a tuning guide tells you.
+
+**Two-phase stays the default.** Single-phase is opt-in per request, because the reserve/
+hold/commit split is what reservations, expiry and the whole crash-window story exist
+for. A sale that has to wait for a payment authorisation cannot use the fast path, and
+most real sales do.
+
+**And it nearly broke idempotency.** The first version did everything in one statement:
+insert the key, probe, write the order, update the key to completed. The update matched
+nothing — sub-statements of one statement cannot see each other's effects, so the row the
+insert had just created was invisible. Every sale succeeded and left its key `in_flight`
+forever, so every retry was told the original was still running. That is the same mistake
+that lost every available unit during shard collapse (entry 3), reached from a different
+direction, which is why it is now written as a rule: **within one statement, never write
+a row that another part of the same statement also writes.** The claim stays in its own
+statement, which is also where it has to be — something must serialise on the key before
+a unit moves, or two concurrent duplicates both take stock on their way to discovering
+they are duplicates.

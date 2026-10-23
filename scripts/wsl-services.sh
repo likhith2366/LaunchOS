@@ -56,9 +56,43 @@ init_db() {
 listen_addresses = '127.0.0.1'
 unix_socket_directories = '$PREFIX/sockets'
 max_connections = 300
-shared_buffers = 256MB
+
+# fsync and synchronous_commit stay on. Every durability claim this project makes rests
+# on commits being real, and the cost of that is itself one of the measurements.
 fsync = on
 synchronous_commit = on
+
+# Group commit, measured and rejected.
+#
+# commit_delay makes a committing transaction pause this many microseconds when others
+# are in flight, so they share one WAL flush. It is the textbook answer when the slowest
+# query in a saturated run is waiting on IO, which this one was.
+#
+# It made things worse. Five isolated runs each: 969 allocations/s without it against
+# 730 with it plus wal_compression. The fsyncs were evidently already being batched
+# effectively, so the delay was pure added latency on the critical path of every sale -
+# and a sale commits two or three times, so it paid the delay twice or three times over.
+#
+# Left here set to zero, with the reasoning, because "we should enable group commit" is
+# the first thing anyone will suggest.
+commit_delay = 0
+
+# wal_compression was measured at the same time and is off for the same reason: it trades
+# CPU for write bandwidth, and on a box where Postgres, Redis, the node and the load
+# generator share eight cores, CPU is not the thing in surplus.
+wal_compression = off
+
+shared_buffers = 1GB
+effective_cache_size = 4GB
+work_mem = 8MB
+
+# Fewer, better-spread checkpoints. At max_wal_size = 1GB a heavy run checkpoints
+# repeatedly and each one stalls writes; raising it trades disk for steadier latency, and
+# completion_target spreads the flush rather than dumping it.
+max_wal_size = 2GB
+min_wal_size = 512MB
+checkpoint_completion_target = 0.9
+wal_buffers = 64MB
 log_min_duration_statement = 2000
 CONF
   fi

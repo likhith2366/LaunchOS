@@ -858,6 +858,104 @@ struct IdempotencyIntegrationTests {
         #expect(purchases >= 10)
     }
 
+    /// Single-phase checkout has to keep every guarantee the two-phase path keeps,
+    /// because it is the same sale taking a shortcut, not a different product.
+    @Test("single-phase checkout does not oversell")
+    func singlePhaseDoesNotOversell() async throws {
+        let h = try await Harness()
+        defer { h.shutdown() }
+        let units = 40
+        let launch = try await h.makeLaunch(units: units, shards: 4)
+        let checkout = coordinator(h)
+
+        var purchases = 0
+        try await withThrowingTaskGroup(of: Bool.self) { group in
+            for i in 0..<(units * 5) {
+                group.addTask {
+                    let response = try? await checkout.checkoutSinglePhase(
+                        CheckoutRequest(
+                            launchID: launch.id, customerID: "c\(i)",
+                            idempotencyKey: self.key("single-\(i)")
+                        ),
+                        enforceAdmission: false
+                    )
+                    return response?.outcome == .purchased
+                }
+            }
+            for try await ok in group where ok { purchases += 1 }
+        }
+
+        #expect(purchases == units, "\(purchases) sold of \(units) units")
+        let state = try await h.store.assertInvariant(launchID: launch.id)
+        #expect(state.sold == units)
+        #expect(state.available == 0)
+        // Straight from available to sold: nothing is left held, because nothing was
+        // ever holding it.
+        #expect(state.reserved == 0)
+        #expect(try await h.store.orderCount(launchID: launch.id) == units)
+    }
+
+    @Test("single-phase checkout is idempotent")
+    func singlePhaseIsIdempotent() async throws {
+        let h = try await Harness()
+        defer { h.shutdown() }
+        let launch = try await h.makeLaunch(units: 10, shards: 2)
+        let checkout = coordinator(h)
+        let request = CheckoutRequest(
+            launchID: launch.id, customerID: "buyer", idempotencyKey: key("single-retry")
+        )
+
+        let first = try await checkout.checkoutSinglePhase(request, enforceAdmission: false)
+        #expect(first.outcome == .purchased)
+        #expect(!first.replayed)
+
+        for _ in 0..<4 {
+            let again = try await checkout.checkoutSinglePhase(request, enforceAdmission: false)
+            #expect(again.outcome == .purchased)
+            #expect(again.orderID == first.orderID, "a retry produced a different order")
+            #expect(again.replayed)
+        }
+
+        #expect(try await h.store.orderCount(launchID: launch.id) == 1)
+        let state = try await h.store.assertInvariant(launchID: launch.id)
+        #expect(state.sold == 1)
+    }
+
+    /// The race the key exists for, on the faster path.
+    @Test("concurrent single-phase duplicates produce one order each")
+    func singlePhaseConcurrentDuplicates() async throws {
+        let h = try await Harness()
+        defer { h.shutdown() }
+        let launch = try await h.makeLaunch(units: 20, shards: 4)
+        let checkout = coordinator(h)
+
+        var orderIDs = Set<UUID>()
+        try await withThrowingTaskGroup(of: CheckoutResponse?.self) { group in
+            for customer in 0..<10 {
+                let request = CheckoutRequest(
+                    launchID: launch.id, customerID: "c\(customer)",
+                    idempotencyKey: "single-dup-\(customer)-\(launch.id.uuidString)"
+                )
+                for _ in 0..<4 {
+                    group.addTask {
+                        try? await checkout.checkoutSinglePhase(request, enforceAdmission: false)
+                    }
+                }
+            }
+            for try await response in group {
+                guard let response, response.outcome == .purchased,
+                    let id = response.orderID
+                else { continue }
+                orderIDs.insert(id)
+            }
+        }
+
+        #expect(orderIDs.count == 10, "\(orderIDs.count) distinct orders for 10 customers")
+        #expect(try await h.store.orderCount(launchID: launch.id) == 10)
+        let state = try await h.store.assertInvariant(launchID: launch.id)
+        #expect(state.sold == 10)
+    }
+
     /// A key reused for different content is a client bug, and saying so is better than
     /// answering with the wrong order.
     @Test("reusing a key for a different request is rejected")
