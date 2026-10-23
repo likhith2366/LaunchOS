@@ -404,6 +404,69 @@ func routes(_ app: Application) throws {
         return RecoveryView(reservationsReclaimed: orphans, claimsReleased: claims)
     }
 
+    /// Bulk-loads synthetic waiting entries so behaviour can be measured at a queue
+    /// depth that would take hours to reach one HTTP join at a time.
+    ///
+    /// Behind the same flag as reset, because it writes rows no customer asked for.
+    app.post("launches", ":sku", "queue", "seed") { req async throws -> SeedQueueView in
+        guard ProcessInfo.processInfo.environment["ALLOW_RESET"] != "0" else {
+            throw Abort(.forbidden, reason: "seeding disabled")
+        }
+        let sku = try req.parameters.require("sku")
+        let body = try req.content.decode(SeedQueueBody.self)
+        let n = req.node
+        let launch = try await n.launch(sku: sku)
+        guard let sequence = launch.queueSequence else {
+            throw Abort(.badRequest, reason: "\(sku) has no arrival sequence")
+        }
+        let existing = try await n.room.depth(launchID: launch.id)
+        let inserted = try await n.room.seedWaiting(
+            launchID: launch.id,
+            arrivalSequence: sequence,
+            from: existing + 1,
+            to: body.count,
+            prefix: body.prefix ?? "seed"
+        )
+        // The departure baseline was computed against the old depth.
+        await n.positions.forget(launchID: launch.id)
+        return SeedQueueView(
+            inserted: inserted, queueDepth: try await n.room.depth(launchID: launch.id)
+        )
+    }
+
+    /// Times the constant-time estimate against the exact count, inside the node.
+    ///
+    /// Server-side because the difference is around a millisecond and an HTTP
+    /// round-trip is several — timing this from a client compares two numbers that are
+    /// mostly network.
+    app.post("launches", ":sku", "queue", "benchmark") { req async throws -> PositionBenchmarkView in
+        guard ProcessInfo.processInfo.environment["ALLOW_RESET"] != "0" else {
+            throw Abort(.forbidden, reason: "benchmarking disabled")
+        }
+        let sku = try req.parameters.require("sku")
+        let body = try? req.content.decode(PositionBenchmarkBody.self)
+        let n = req.node
+        let launch = try await n.launch(sku: sku)
+        let customerID: String
+        if let requested = body?.customerID {
+            customerID = requested
+        } else {
+            guard let back = try await n.room.lastWaitingCustomer(launchID: launch.id) else {
+                throw Abort(.badRequest, reason: "nobody is waiting for \(sku)")
+            }
+            customerID = back
+        }
+        let benchmark = PositionBenchmark(
+            room: n.room, estimator: n.positions, logger: n.logger
+        )
+        return PositionBenchmarkView(
+            result: try await benchmark.run(
+                launchID: launch.id, customerID: customerID,
+                iterations: body?.iterations ?? 25
+            )
+        )
+    }
+
     app.post("admin", "reset") { req async throws -> HTTPStatus in
         guard ProcessInfo.processInfo.environment["ALLOW_RESET"] != "0" else {
             throw Abort(.forbidden, reason: "reset disabled")

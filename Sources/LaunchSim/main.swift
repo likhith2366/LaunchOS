@@ -19,7 +19,8 @@ struct LaunchSim: AsyncParsableCommand {
             """,
         subcommands: [
             Oversell.self, ShardSweep.self, Controller.self, Fairness.self,
-            Tail.self, Idempotency.self, SweepProbe.self, Horizon.self, All.self,
+            Tail.self, Idempotency.self, SweepProbe.self, Horizon.self,
+            PositionScale.self, All.self,
         ]
     )
 }
@@ -342,6 +343,48 @@ struct Horizon: AsyncParsableCommand {
                     )
                 )
             }
+            print(result.explanation)
+        }
+    }
+}
+
+struct PositionScale: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "position-scale",
+        abstract: "Measure what a queue position costs as the queue gets deeper.",
+        discussion: """
+            Seeds a waiting room to each depth in turn and times both ways of answering             "how many people are ahead of me": the constant-time estimate, and the count             it replaced. Both are measured inside the node, over the same rows, in the             same call.
+            """
+    )
+
+    @OptionGroup var options: GlobalOptions
+    @Option(help: "Queue depths to measure at, repeated.")
+    var depth: [Int] = [1_000, 10_000, 100_000, 1_000_000]
+    @Option(help: "Timed iterations of each path at each depth.")
+    var iterations: Int = 25
+
+    func run() async throws {
+        try await withClient(options) { client in
+            let result = try await runPositionScale(
+                client: client, depths: depth, iterations: iterations
+            )
+            print(
+                String(
+                    format: "%10s  %12s  %12s  %10s  %14s  %s",
+                    "depth", "estimated", "exact", "speedup", "exact p99", "error"
+                )
+            )
+            for point in result.points {
+                print(
+                    String(
+                        format: "%10d  %10.3fms  %10.3fms  %9.1fx  %12.3fms  %d (%.4f%%)",
+                        point.queueDepth, point.estimatedMedianMS, point.exactMedianMS,
+                        point.speedup, point.exactP99MS, point.positionError,
+                        point.positionErrorPercent
+                    )
+                )
+            }
+            print()
             print(result.explanation)
         }
     }

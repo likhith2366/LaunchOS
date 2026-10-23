@@ -181,6 +181,71 @@ public struct WaitingRoom: Sendable {
         return 0
     }
 
+    /// The customer at the back of the waiting queue.
+    ///
+    /// The worst case for a position count — the whole queue is ahead of them — and no
+    /// harder for the estimate, which is why the benchmark asks about this one.
+    public func lastWaitingCustomer(launchID: UUID) async throws -> String? {
+        let rows = try await store.client.query(
+            """
+            SELECT customer_id FROM queue_entries
+             WHERE launch_id = \(launchID) AND state = 'waiting'
+             ORDER BY seq DESC LIMIT 1
+            """,
+            logger: logger
+        )
+        for try await customer in rows.decode(String.self) { return customer }
+        return nil
+    }
+
+    /// Bulk-loads synthetic waiting entries, for measuring behaviour at a queue depth
+    /// that would take far too long to reach one HTTP join at a time.
+    ///
+    /// Deliberately not reachable without the admin flag. It writes rows that no
+    /// customer ever asked for, which is exactly what a load measurement needs and
+    /// exactly what a production deployment must not expose.
+    ///
+    /// `generate_series` because the point is to arrive at a depth, not to measure how
+    /// long arriving takes — that is a different experiment, and it runs over HTTP like
+    /// a real customer would.
+    @discardableResult
+    public func seedWaiting(
+        launchID: UUID,
+        arrivalSequence: String,
+        from startIndex: Int,
+        to endIndex: Int,
+        prefix: String = "seed"
+    ) async throws -> Int {
+        guard endIndex >= startIndex else { return 0 }
+        var binds = PostgresBindings()
+        binds.append(launchID, context: .default)
+        binds.append(prefix, context: .default)
+        binds.append(startIndex, context: .default)
+        binds.append(endIndex, context: .default)
+        binds.append(arrivalSequence, context: .default)
+        let rows = try await store.client.query(
+            PostgresQuery(
+                unsafeSQL: """
+                    INSERT INTO queue_entries
+                        (launch_id, customer_id, arrival_index, bucket, arrival_at, state)
+                    SELECT $1, $2 || '-' || g, nextval($5::regclass), 0,
+                           now() - interval '1 hour', 'waiting'
+                      FROM generate_series($3, $4) g
+                    ON CONFLICT DO NOTHING
+                    RETURNING 1
+                    """,
+                binds: binds
+            ),
+            logger: logger
+        )
+        var inserted = 0
+        for try await _ in rows.decode(Int.self) { inserted += 1 }
+        // The planner's row estimates decide whether the exact count uses the partial
+        // index, so a measurement taken before ANALYZE is measuring a stale plan.
+        _ = try await store.client.query("ANALYZE queue_entries", logger: logger)
+        return inserted
+    }
+
     /// Reads a customer's queue entry without computing their position.
     ///
     /// Position is a separate call because it is the expensive half — a count over the

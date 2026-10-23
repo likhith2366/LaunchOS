@@ -200,6 +200,20 @@ struct LaunchClient: Sendable {
         ).value
     }
 
+    func seedQueue(sku: String, count: Int) async throws -> SeedQueueInfo? {
+        try await send(
+            .POST, "/launches/\(sku)/queue/seed", body: ["count": count],
+            salt: 0, decode: SeedQueueInfo.self
+        ).value
+    }
+
+    func positionBenchmark(sku: String, iterations: Int) async throws -> PositionBenchmarkResult? {
+        try await send(
+            .POST, "/launches/\(sku)/queue/benchmark", body: ["iterations": iterations],
+            salt: 0, decode: PositionBenchmarkEnvelope.self
+        ).value?.result
+    }
+
     func nodeStatus(index: Int) async throws -> NodeStatus? {
         try await send(
             .GET, "/node", body: Optional<Empty>.none, salt: UInt64(index), decode: NodeStatus.self
@@ -362,4 +376,13 @@ struct NodeStatus: Decodable, Sendable {
     var redisEnabled: Bool
     var sweepStrategy: String
     var maxProbes: Int
+}
+
+struct SeedQueueInfo: Codable, Sendable {
+    var inserted: Int
+    var queueDepth: Int
+}
+
+struct PositionBenchmarkEnvelope: Codable, Sendable {
+    var result: PositionBenchmarkResult
 }
