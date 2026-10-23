@@ -170,6 +170,152 @@ public struct CheckoutCoordinator: Sendable {
     /// created without a waiting room has no admission to check, which is the week-one
     /// baseline and also how the sharding and idempotency experiments run. Defaulting it
     /// to the node-wide setting would make those runs depend on how the node was started.
+    /// Checkout in a single statement, for sales with no payment step.
+    ///
+    /// The two-phase flow below is the one that matters architecturally: reserve, hold,
+    /// commit when payment authorises, and let expiry reclaim the unit if it never does.
+    /// It costs three commits per sale, and three WAL flushes is the dominant per-sale
+    /// cost once row contention is gone.
+    ///
+    /// When nothing happens between reserving and committing — an immediate sale, a free
+    /// drop, a claim against an entitlement already held — those three commits have
+    /// nothing to separate them. This does the work once and keeps every guarantee: the
+    /// key is still claimed before a unit moves, the order still commits with the record
+    /// a retry reads from, and the invariant still holds at every instant.
+    ///
+    /// Falls back to the two-phase path for the cases it cannot answer in one statement:
+    /// a key that already exists needs its stored answer read back, and a probe set that
+    /// found no stock needs the sold-out-versus-fragmented distinction, which takes
+    /// another read.
+    public func checkoutSinglePhase(
+        _ request: CheckoutRequest,
+        enforceAdmission: Bool? = nil
+    ) async throws -> CheckoutResponse {
+        let started = ContinuousClock.now
+        await health.checkoutStarted()
+        do {
+            let response = try await performSinglePhase(
+                request, enforceAdmission: enforceAdmission
+            )
+            await recordCompletion(started: started, failed: false)
+            return response
+        } catch {
+            await recordCompletion(started: started, failed: Self.isServerFailure(error))
+            throw error
+        }
+    }
+
+    private func performSinglePhase(
+        _ request: CheckoutRequest,
+        enforceAdmission: Bool?
+    ) async throws -> CheckoutResponse {
+        if enforceAdmission ?? requireAdmission {
+            let cached = await coordination?.isAdmittedCached(
+                launchID: request.launchID, customerID: request.customerID
+            )
+            if cached != true {
+                guard
+                    try await room.isAdmitted(
+                        launchID: request.launchID, customerID: request.customerID
+                    )
+                else {
+                    throw LaunchError.notAdmitted(request.customerID)
+                }
+            }
+        }
+
+        // The key is claimed in its own statement, exactly as the two-phase path does it,
+        // and for the same non-negotiable reason: something has to serialise on the key
+        // before a unit can move, or two concurrent duplicates both take stock on their
+        // way to finding out they are duplicates. Reusing `claim` also means the
+        // duplicate, conflict and in-flight semantics are the ones already tested rather
+        // than a second implementation of them.
+        switch try await claim(request) {
+        case .completed(let response):
+            await MetricsRegistry.shared.increment("launchos_idempotent_replays_total")
+            return response.replaying()
+        case .conflict:
+            throw LaunchError.idempotencyConflict(request.idempotencyKey)
+        case .inFlight:
+            throw LaunchError.idempotencyInFlight(request.idempotencyKey)
+        case .claimed:
+            break
+        }
+
+        do {
+            let launch = try await allocator.launchConfig(request.launchID)
+            let shards = launch.collapsed
+                ? [0]
+                : Allocator.probeOrder(
+                    customerID: request.customerID, shardCount: launch.shardCount,
+                    limit: allocator.config.maxProbes
+                )
+
+            // Built before the statement runs, so the answer a retry reads back commits
+            // in the same transaction as the order it describes.
+            let orderID = UUID()
+            let reservationID = UUID()
+            let response = CheckoutResponse(
+                outcome: .purchased, orderID: orderID, reservationID: reservationID,
+                units: request.units, probes: shards.count
+            )
+            let json = String(data: try JSONEncoder().encode(response), encoding: .utf8)
+
+            var outcome = try await store.takeAndRecord(
+                launchID: request.launchID, shardIDs: shards,
+                customerID: request.customerID, units: request.units, ownerNode: nodeID,
+                ttl: launch.reservationTTL, idempotencyKey: request.idempotencyKey,
+                responseJSON: json, orderID: orderID, reservationID: reservationID
+            )
+
+            // A shard held by another transaction is not a sell-out, for the same reason
+            // it is not in the two-phase path: the first pass skips locked rows to spread
+            // load, and a pass willing to wait is what stops a momentary lock being
+            // reported as no stock.
+            if case .noStock = outcome.result {
+                outcome = try await store.takeAndRecord(
+                    launchID: request.launchID, shardIDs: shards,
+                    customerID: request.customerID, units: request.units,
+                    ownerNode: nodeID, ttl: launch.reservationTTL,
+                    idempotencyKey: request.idempotencyKey, responseJSON: json,
+                    orderID: orderID, reservationID: reservationID, skipLocked: false
+                )
+            }
+
+            switch outcome.result {
+            case .purchased:
+                await MetricsRegistry.shared.increment(
+                    "launchos_purchases_total", help: "Completed purchases"
+                )
+                await MetricsRegistry.shared.increment(
+                    "launchos_single_phase_purchases_total",
+                    help: "Purchases that took a unit and recorded the order in one statement"
+                )
+                return response
+
+            case .noStock:
+                let remaining =
+                    (try? await store.availableUnits(launchID: request.launchID)) ?? 0
+                let answer = CheckoutResponse(
+                    outcome: remaining > 0 ? .fragmented : .soldOut, probes: outcome.probes
+                )
+                // This request owns an in-flight key, so it has to be left terminal or a
+                // retry would block on a record nobody is going to finish.
+                try await finalize(request, state: "completed", response: answer)
+                await MetricsRegistry.shared.increment(
+                    remaining > 0
+                        ? "launchos_fragmentation_failures_total" : "launchos_soldout_total"
+                )
+                return answer
+            }
+        } catch {
+            // Release the key so the customer can retry, rather than leaving a permanent
+            // in-flight record that locks them out of their own order.
+            try? await releaseClaim(request)
+            throw error
+        }
+    }
+
     public func checkout(
         _ request: CheckoutRequest,
         enforceAdmission: Bool? = nil

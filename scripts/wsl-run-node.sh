@@ -23,6 +23,10 @@ export PORT="${PORT:-8080}"
 export MULTI_NODE_MODE="${MULTI_NODE_MODE:-postgresArbitrated}"
 export SWEEP_STRATEGY="${SWEEP_STRATEGY:-bucketed}"
 export LOG_LEVEL="${LOG_LEVEL:-notice}"
+# The deep half of the invariant check scans whole tables. Left at two minutes it lands
+# inside some benchmark runs and not others, which makes throughput look bimodal.
+export SELF_CHECK_SECONDS="${SELF_CHECK_SECONDS:-5}"
+export SELF_CHECK_DEEP_SECONDS="${SELF_CHECK_DEEP_SECONDS:-120}"
 # The connection pool is per node. Several nodes plus the simulator have to fit inside
 # Postgres's max_connections, so this is deliberately modest rather than generous.
 export POSTGRES_POOL="${POSTGRES_POOL:-32}"

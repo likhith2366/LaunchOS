@@ -191,9 +191,50 @@ data:
 | Admission check | a Postgres read per checkout | a Redis set lookup, falling through to Postgres on a miss |
 | Invariant self-check | 2 O(table) scans every 5s | O(shards) every 5s, table scans every 2 minutes |
 | Load generator | one task per customer | bounded worker pool, scripts derived from seed + index |
+| Commits per sale | 3 | 2, where no payment step separates reserve from commit |
 
 The details, and what each one cost to get right, are in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#what-it-takes-to-reach-a-million).
+
+### Allocation throughput, and a measurement that was lying to me
+
+Pushing allocation throughput was mostly a story of failed attempts, and the failures are
+the useful part.
+
+Repeated runs of the *same* workload on the *same* configuration returned 1090, 862,
+1049, 881 and 602 allocations/s — a **55% spread**. Every single-run comparison made
+before that point was inside the noise and therefore meaningless. Two causes: runs
+inherited their predecessor's dead tuples and WAL state, and the deep half of the
+invariant check scans whole tables every two minutes, so it landed inside some
+forty-second runs and not others — which produced a cleanly bimodal distribution, half
+near 880/s and half near 1450/s. Isolating runs and making that interval configurable cut
+the spread to 23%. `scripts/bench-repeat.sh` now reports the spread beside every number,
+and nothing below is claimed unless it clears it.
+
+What then failed: **group commit**, the textbook fix when the slowest query is waiting on
+IO, measured 969/s without it against 730/s with it — the fsyncs were already batched, so
+`commit_delay` was pure latency on a path that commits two or three times. And **removing
+three indexes** that served maintenance running every few minutes, while costing a
+WAL-logged insert on every write, cut WAL per sale 14% but sat below the noise floor for
+throughput, so no speed claim is made for it.
+
+What worked was a trade rather than a knob. A sale costs three commits; where no payment
+step separates reserving from committing, the last two merge into one statement. On its
+own that was *slower* — the merged statement holds the shard row lock across three more
+writes, which costs more than the round-trip it saves. But the two effects interact:
+
+| | 16 shards | 64 shards |
+| --- | --- | --- |
+| two-phase, 3 commits | 969/s | 957/s |
+| single-phase, 2 commits | 852/s | **1298/s** |
+
+**+34%**, clearing the floor, with the best runs at 1479/s and p99 234 ms. Pursuing fewer
+round-trips in isolation made things worse; the right shard count turns out to depend on
+how the writes are batched, which is not something a tuning guide tells you.
+
+Two-phase remains the default and single-phase is opt-in per request, because the
+reserve/hold/commit split is what reservations, expiry and the entire crash-window story
+exist for — a sale waiting on a payment authorisation cannot use the fast path.
 
 ## The hot row
 
@@ -474,6 +515,11 @@ Kept because the project is not worth much without them.
   The lesson generalises past this codebase: verification that scales with the data will
   eventually cost more than the work it is checking, and the cheap half of a check is
   usually the half that catches the bug.
+- **Allocation throughput is ~1300/s, and that is a laptop number.** A tuned Postgres on
+  real hardware does far more. The honest ceiling here is durable commits on a WSL
+  virtual disk plus everything sharing eight cores, and the measurement noise floor on
+  this box is 23% — so further micro-optimisation is not measurable here, let alone
+  worth claiming.
 - **Single machine, single Postgres.** Every number is from one 8-core WSL2 host with the
   database, Redis, the allocator node and the load generator all on it, competing for the
   same eight cores. The shapes are real; the absolute figures are a laptop's.

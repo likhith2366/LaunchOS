@@ -371,13 +371,20 @@ func routes(_ app: Application) throws {
         // A launch with no waiting room has no admission to check. The flag is read from
         // the launch row rather than from this node's controller registry, so a request
         // that lands on a node which did not create the launch behaves identically.
-        let response = try await n.checkout.checkout(
-            CheckoutRequest(
-                launchID: launch.id, customerID: body.customerID,
-                units: body.units ?? 1, idempotencyKey: body.idempotencyKey
-            ),
-            enforceAdmission: launch.requiresAdmission
+        let checkoutRequest = CheckoutRequest(
+            launchID: launch.id, customerID: body.customerID,
+            units: body.units ?? 1, idempotencyKey: body.idempotencyKey
         )
+        // Single-phase is opt-in per request, not a mode the deployment is put into: the
+        // same launch can sell some units with a payment step and some without.
+        let response =
+            (body.singlePhase ?? false)
+            ? try await n.checkout.checkoutSinglePhase(
+                checkoutRequest, enforceAdmission: launch.requiresAdmission
+            )
+            : try await n.checkout.checkout(
+                checkoutRequest, enforceAdmission: launch.requiresAdmission
+            )
         return CheckoutView(response)
     }
 

@@ -152,6 +152,9 @@ struct RunConfig: Sendable {
     var admissionTickInterval: Duration
     /// Poll interval while waiting in the queue.
     var pollInterval: Duration
+    /// Sell in one statement rather than reserve-then-commit. Only valid where there is
+    /// no payment step between the two, which is every experiment in here.
+    var singlePhase: Bool = false
 }
 
 /// Drives one measured run.
@@ -362,7 +365,8 @@ struct Runner: Sendable {
         do {
             let reply = try await client.checkout(
                 sku: config.sku, customerID: script.customerID,
-                idempotencyKey: script.idempotencyKey, salt: script.salt
+                idempotencyKey: script.idempotencyKey, salt: script.salt,
+                singlePhase: config.singlePhase
             )
             attempt.latencyMS = reply.latencyMS
             if let value = reply.value {

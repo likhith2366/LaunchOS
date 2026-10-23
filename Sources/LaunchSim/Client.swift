@@ -134,11 +134,19 @@ struct LaunchClient: Sendable {
     }
 
     func checkout(
-        sku: String, customerID: String, units: Int = 1, idempotencyKey: String, salt: UInt64
+        sku: String,
+        customerID: String,
+        units: Int = 1,
+        idempotencyKey: String,
+        salt: UInt64,
+        singlePhase: Bool = false
     ) async throws -> Reply<CheckoutResult> {
         try await send(
             .POST, "/launches/\(sku)/checkout",
-            body: CheckoutRequestBody(customerID: customerID, units: units, idempotencyKey: idempotencyKey),
+            body: CheckoutRequestBody(
+                customerID: customerID, units: units, idempotencyKey: idempotencyKey,
+                singlePhase: singlePhase
+            ),
             salt: salt, decode: CheckoutResult.self
         )
     }
@@ -267,6 +275,7 @@ struct CheckoutRequestBody: Encodable, Sendable {
     var customerID: String
     var units: Int
     var idempotencyKey: String
+    var singlePhase: Bool
 }
 
 struct LaunchInfo: Decodable, Sendable {

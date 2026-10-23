@@ -60,8 +60,7 @@ CREATE INDEX IF NOT EXISTS reservations_expiry_idx
 -- Supports the bucketed sweep strategy.
 CREATE INDEX IF NOT EXISTS reservations_bucket_idx
     ON reservations (expiry_bucket) WHERE state = 'held';
-CREATE INDEX IF NOT EXISTS reservations_launch_idx
-    ON reservations (launch_id, state);
+
 
 CREATE TABLE IF NOT EXISTS orders (
     id              UUID PRIMARY KEY,
@@ -152,16 +151,38 @@ CREATE INDEX IF NOT EXISTS shard_leases_owner_idx ON shard_leases (launch_id, ow
 ALTER TABLE launches ADD COLUMN IF NOT EXISTS queue_sequence TEXT;
 ALTER TABLE queue_entries ADD COLUMN IF NOT EXISTS arrival_index BIGINT NOT NULL DEFAULT 0;
 
--- Supports the periodic duplicate-order reconciliation, which joins orders against
--- idempotency keys on (launch, customer). Without these it is two sequential scans and
--- a hash join over whole tables; the check is deliberately infrequent, but infrequent
--- and unindexed still means a multi-hundred-megabyte read competing with a launch.
-CREATE INDEX IF NOT EXISTS orders_customer_idx ON orders (launch_id, customer_id);
-CREATE INDEX IF NOT EXISTS idempotency_launch_customer_idx
-    ON idempotency_keys (launch_id, customer_id);
 
--- Supports the idempotency retention sweep. Without it, finding expired records is a
--- sequential scan of the largest table in the system.
-CREATE INDEX IF NOT EXISTS idempotency_retention_idx
-    ON idempotency_keys (created_at) WHERE state <> 'in_flight';
+
+-- Indexes dropped, and why. Measured on a 40,000-sale run.
+--
+-- An index that serves a query running every few minutes is still paid for on every
+-- single write, because each entry is a WAL-logged insert. This workload writes about
+-- 3KB of write-ahead log per sale against roughly 900 bytes of actual row data, and
+-- index maintenance is where most of the difference goes.
+--
+-- These four reported zero or one scan on that run while occupying about 7.7MB of index
+-- for 40,000 rows:
+--
+--   orders_customer_idx, idempotency_launch_customer_idx
+--     Added to speed up the duplicate-order reconciliation, which runs every two
+--     minutes and is belt-and-braces anyway: orders.reservation_id is unique, so a
+--     duplicate order per key cannot happen without that constraint failing first. A
+--     full scan every two minutes is far cheaper than indexing every write.
+--
+--   idempotency_retention_idx
+--     Added so retention could find expired records without scanning the largest table.
+--     It turns out not to need one: records are inserted in time order, so they sit in
+--     roughly that order in the heap, and the sweep's LIMIT lets a sequential scan stop
+--     as soon as it has a batch.
+--
+--   reservations_launch_idx
+--     Only served orphan recovery, which runs on demand after a node dies.
+--
+-- The primary keys and unique constraints stay regardless of scan count: they are not
+-- there to make reads fast, they are what makes a second order per reservation
+-- impossible.
+DROP INDEX IF EXISTS orders_customer_idx;
+DROP INDEX IF EXISTS idempotency_launch_customer_idx;
+DROP INDEX IF EXISTS idempotency_retention_idx;
+DROP INDEX IF EXISTS reservations_launch_idx;
 """

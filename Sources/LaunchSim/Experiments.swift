@@ -212,7 +212,8 @@ func runShardSweep(
     units: Int,
     contenders: Int,
     seed: UInt64,
-    connectionLimit: Int
+    connectionLimit: Int,
+    singlePhase: Bool = false
 ) async throws -> ShardSweepResult {
     var points: [ShardPoint] = []
     var baseline: Double = 0
@@ -247,7 +248,8 @@ func runShardSweep(
                 admissionTimeout: .seconds(1),
                 driveAdmission: false,
                 admissionTickInterval: .milliseconds(250),
-                pollInterval: .milliseconds(50)
+                pollInterval: .milliseconds(50),
+                singlePhase: singlePhase
             )
         )
         let (outcome, _) = try await runner.run()

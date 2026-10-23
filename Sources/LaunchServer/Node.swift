@@ -75,7 +75,17 @@ final class Node: Sendable {
         )
         self.recovery = CrashRecovery(store: store, coordination: coordination, logger: logger)
         self.leases = LeaseManager(store: store, nodeID: nodeID, logger: logger)
-        self.selfCheck = SelfCheck(store: store, logger: logger)
+        // Both intervals are configurable because the deep check scans whole tables, so
+        // it lands inside some benchmark runs and not others - which showed up as a
+        // bimodal throughput distribution, half the runs at 880/s and half at 1450/s,
+        // until it was possible to turn the interval up and see the two modes collapse
+        // into one.
+        self.selfCheck = SelfCheck(
+            store: store,
+            logger: logger,
+            interval: .seconds(Double(env["SELF_CHECK_SECONDS"] ?? "5") ?? 5),
+            deepInterval: .seconds(Double(env["SELF_CHECK_DEEP_SECONDS"] ?? "120") ?? 120)
+        )
         self.controllers = ControllerRegistry()
         self.directory = LaunchDirectory()
     }

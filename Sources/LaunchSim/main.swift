@@ -149,12 +149,19 @@ struct ShardSweep: AsyncParsableCommand {
     @Option var units: Int = 2_000
     @Option var contenders: Int = 4_000
     @Option(help: "Shard counts to sweep, repeated.") var shards: [Int] = [1, 4, 16, 64]
+    @Flag(
+        help: """
+            Sell in one statement instead of reserve-then-commit. Valid where no payment             step sits between the two, which costs two commits per sale rather than three.
+            """
+    )
+    var singlePhase: Bool = false
 
     func run() async throws {
         try await withClient(options) { client in
             let result = try await runShardSweep(
                 client: client, shardCounts: shards, units: units, contenders: contenders,
-                seed: options.seed, connectionLimit: options.connections
+                seed: options.seed, connectionLimit: options.connections,
+                singlePhase: singlePhase
             )
             for p in result.points {
                 print(
